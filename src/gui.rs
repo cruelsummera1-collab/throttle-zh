@@ -14,6 +14,7 @@ use egui_plot::{Legend, Line, Plot, PlotPoints};
 use crate::backend::rules;
 use crate::backend::synthetic::{is_shapable, is_system};
 use crate::types::{Command, ProcessStats, Rule, Snapshot};
+use crate::update_check::{self, UpdateInfo};
 
 /// How many total-rate samples we keep for the header graph.
 const TOTAL_HISTORY_LEN: usize = 120;
@@ -189,6 +190,18 @@ pub struct ThrottleApp {
     limit_modal: Option<LimitModal>,
     about_open: bool,
     shutdown_sent: bool,
+
+    update_rx: Receiver<UpdateInfo>,
+    update: Option<UpdateInfo>,
+    update_dismissed: bool,
+    update_install: UpdateInstall,
+}
+
+/// Progress of an in-app update started from the banner.
+enum UpdateInstall {
+    Idle,
+    Running(Receiver<Result<std::path::PathBuf, String>>),
+    Failed(String),
 }
 
 impl ThrottleApp {
@@ -209,6 +222,10 @@ impl ThrottleApp {
             limit_modal: None,
             about_open: false,
             shutdown_sent: false,
+            update_rx: update_check::spawn(APP_VERSION),
+            update: None,
+            update_dismissed: false,
+            update_install: UpdateInstall::Idle,
         }
     }
 
@@ -354,7 +371,11 @@ impl ThrottleApp {
                         open_url(ui.ctx(), &format!("{REPO_URL}/issues/new"));
                         ui.close();
                     }
-                    if ui.button("Check for updates…").clicked() {
+                    let update_label = match &self.update {
+                        Some(u) => format!("Update available: v{}…", u.version),
+                        None => "Check for updates…".to_string(),
+                    };
+                    if ui.button(update_label).clicked() {
                         open_url(ui.ctx(), &format!("{REPO_URL}/releases/latest"));
                         ui.close();
                     }
@@ -369,6 +390,89 @@ impl ThrottleApp {
                         ui.close();
                     }
                 });
+            });
+        });
+    }
+
+    fn draw_update_banner(&mut self, ui: &mut egui::Ui) {
+        if self.update_dismissed {
+            return;
+        }
+        let Some(update) = self.update.clone() else {
+            return;
+        };
+
+        // Poll a running install; on success relaunch the new build and quit.
+        if let UpdateInstall::Running(rx) = &self.update_install
+            && let Ok(result) = rx.try_recv()
+        {
+            let relaunched = result.and_then(|exe| {
+                std::process::Command::new(&exe)
+                    .args(["--wait-pid", &std::process::id().to_string()])
+                    .spawn()
+                    .map_err(|e| format!("could not start the new version: {e}"))
+            });
+            self.update_install = match relaunched {
+                Ok(_) => {
+                    self.send_shutdown();
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    UpdateInstall::Idle
+                }
+                Err(e) => {
+                    tracing::error!("update failed: {e}");
+                    UpdateInstall::Failed(e)
+                }
+            };
+        }
+
+        let release_page = if update.url.is_empty() {
+            format!("{REPO_URL}/releases/latest")
+        } else {
+            update.url.clone()
+        };
+
+        egui::Panel::top("update_banner").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Throttle v{} is available (you have v{APP_VERSION}).",
+                        update.version
+                    ))
+                    .strong(),
+                );
+                if let UpdateInstall::Running(_) = self.update_install {
+                    ui.spinner();
+                    ui.label("Downloading update…");
+                    return;
+                }
+                if let UpdateInstall::Failed(e) = &self.update_install {
+                    ui.label(egui::RichText::new(format!("Update failed: {e}")).color(COLOR_BLOCK));
+                }
+                match &update.asset_url {
+                    Some(asset_url) => {
+                        if ui.button("Update and restart").clicked() {
+                            let (tx, rx) = crossbeam_channel::bounded(1);
+                            let asset_url = asset_url.clone();
+                            std::thread::spawn(move || {
+                                let result =
+                                    update_check::install(&asset_url).map_err(|e| format!("{e:#}"));
+                                let _ = tx.send(result);
+                            });
+                            self.update_install = UpdateInstall::Running(rx);
+                        }
+                        if ui.button("Release notes").clicked() {
+                            open_url(ui.ctx(), &release_page);
+                        }
+                    }
+                    None => {
+                        if ui.button("Download").clicked() {
+                            open_url(ui.ctx(), &release_page);
+                        }
+                    }
+                }
+                if ui.button("Dismiss").clicked() {
+                    self.update_dismissed = true;
+                }
             });
         });
     }
@@ -846,7 +950,12 @@ impl eframe::App for ThrottleApp {
             self.selected = None;
         }
 
+        if let Ok(update) = self.update_rx.try_recv() {
+            self.update = Some(update);
+        }
+
         self.draw_menu_bar(ui);
+        self.draw_update_banner(ui);
         self.draw_top_panel(ui, &snap);
         self.draw_detail_panel(ui, &snap);
         self.draw_table(ui, &snap);

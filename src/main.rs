@@ -15,6 +15,7 @@ mod gui;
 mod icon;
 mod single_instance;
 mod types;
+mod update_check;
 
 use crossbeam_channel::unbounded;
 
@@ -37,12 +38,23 @@ fn main() -> eframe::Result {
     // every packet and undermine the first one's limits. This runs before the
     // log file is opened, because opening it truncates the running instance's
     // log. The lock is held until the process exits.
+    //
+    // After a self-update the new build is launched while the old one is still
+    // shutting down; wait for it so the lock is free and its rules are saved.
+    if let Some(pid) = std::env::args()
+        .skip_while(|a| a != "--wait-pid")
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+    {
+        update_check::wait_for_pid(pid, std::time::Duration::from_secs(30));
+    }
     let _instance_lock = match single_instance::acquire() {
         Some(lock) => lock,
         None => return Ok(()),
     };
 
     setup_logging();
+    update_check::cleanup_old_exe();
 
     // Panics in worker threads are otherwise invisible (no console): log them.
     std::panic::set_hook(Box::new(|info| {

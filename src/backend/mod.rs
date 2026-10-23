@@ -79,8 +79,8 @@ pub fn start(cmd_rx: Receiver<Command>) -> anyhow::Result<Backend> {
     // elevated, driver missing) surface as a friendly error. Both the engine
     // and drainer threads use this one handle (see engine::EngineHandle).
     let engine_handle = Arc::new(engine::open().context(
-        "failed to open WinDivert. Run Throttle as Administrator and ensure \
-         WinDivert.dll and the driver are present next to the executable",
+        "无法打开 WinDivert：请以管理员身份运行本程序，并确认 WinDivert.dll \
+         与 WinDivert64.sys 和程序在同一目录下",
     )?);
 
     let rules = rules::load();
@@ -206,10 +206,35 @@ fn run_flow_events(shared: Arc<Shared>) {
 }
 
 /// Aggregator thread: emit a snapshot every second and apply commands.
+///
+/// 本 fork 的扩展（都在本线程内完成，开销极小，不阻塞抓包与 UI）：
+/// - 每秒把快照喂给告警状态机（`crate::alert`），触发的事件立即写入历史；
+/// - 每 60 秒把每进程流量增量写入本地历史文件（`crate::history`），
+///   退出时补写最后一个不满 60 秒的周期；
+/// - 告警设置（`Command::SetAlertSettings`）在此生效并持久化。
 fn run_aggregator(shared: Arc<Shared>, cmd_rx: Receiver<Command>, snapshot_tx: Sender<Snapshot>) {
     tracing::info!("aggregator thread started");
     let ticker = crossbeam_channel::tick(Duration::from_secs(1));
     let refresh = crossbeam_channel::tick(TABLE_REFRESH);
+
+    // --- 本 fork 的附加状态 ---
+    let tz_offset = local_utc_offset_secs();
+    let hist_path = crate::history::history_path(&rules::config_dir());
+    if let Err(e) = crate::history::cleanup_file(&hist_path, now_unix()) {
+        tracing::warn!("history cleanup failed: {e}");
+    }
+    let mut accumulator = crate::history::HistoryAccumulator::new();
+    let mut alert_settings = rules::load_settings();
+    let mut alert_engine = crate::alert::AlertEngine::new(
+        alert_settings.up_threshold_bps,
+        alert_settings.duration_secs as u64,
+        alert_settings.ignore.clone(),
+    );
+    let mut tick: u64 = 0;
+    let mut last_flush_tick: u64 = 0;
+    let mut cleanup_day = now_unix() / 86_400;
+    // 每个进程键最近一次触发告警的墙钟时间（供横幅显示触发时刻）。
+    let mut fired_wall: HashMap<String, i64> = HashMap::new();
 
     loop {
         crossbeam_channel::select! {
@@ -245,10 +270,34 @@ fn run_aggregator(shared: Arc<Shared>, cmd_rx: Receiver<Command>, snapshot_tx: S
                             tracing::warn!("failed to persist rules: {e}");
                         }
                     }
+                    Ok(Command::SetAlertSettings(mut s)) => {
+                        s.ignore = s
+                            .ignore
+                            .iter()
+                            .map(|e| e.trim().to_lowercase())
+                            .filter(|e| !e.is_empty())
+                            .collect();
+                        alert_engine.set_config(
+                            s.up_threshold_bps,
+                            s.duration_secs as u64,
+                            s.ignore.clone(),
+                        );
+                        alert_settings = s;
+                        if let Err(e) = rules::save_settings(&alert_settings) {
+                            tracing::warn!("failed to persist alert settings: {e}");
+                        }
+                    }
                     Ok(Command::Shutdown) | Err(_) => {
                         // Explicit shutdown, or the GUI dropped the command sender.
                         tracing::info!("aggregator: shutting down");
                         shared.running.store(false, Ordering::Relaxed);
+                        // 补写退出前最后一个周期的历史增量（尽力而为）。
+                        flush_history(
+                            &mut accumulator,
+                            &hist_path,
+                            tz_offset,
+                            tick - last_flush_tick,
+                        );
                         let snapshot = shared.rules.lock().unwrap().clone();
                         if let Err(e) = rules::save(&snapshot) {
                             tracing::warn!("failed to persist rules on shutdown: {e}");
@@ -269,23 +318,183 @@ fn run_aggregator(shared: Arc<Shared>, cmd_rx: Receiver<Command>, snapshot_tx: S
                 shared.flows.lock().unwrap().apply_socket_snapshot(snap);
             }
             recv(ticker) -> _ => {
+                tick += 1;
                 let (processes, total_down_rate, total_up_rate) =
                     shared.flows.lock().unwrap().snapshot();
+                let now = now_unix();
+
+                // --- 告警判断（纯状态机，开销可忽略） ---
+                // 未归属流量（"<unknown>"）不是进程，不参与告警判断；
+                // 它的字节仍计入历史与总速率。
+                let samples: Vec<crate::alert::ProcSample> = processes
+                    .iter()
+                    .filter(|(k, _)| k.as_str() != crate::backend::synthetic::UNKNOWN_EXE)
+                    .map(|(k, p)| crate::alert::ProcSample {
+                        key: k.clone(),
+                        pid: p.pid,
+                        name: p.name.clone(),
+                        exe_path: p.exe_path.clone(),
+                        up_rate: p.up_rate,
+                    })
+                    .collect();
+                for ev in alert_engine.update(tick, &samples) {
+                    fired_wall.insert(ev.key.clone(), now);
+                    tracing::info!(
+                        "持续高上传告警: {} (pid {}) 以 {} B/s 上传已持续 {} 秒（阈值 {} B/s）",
+                        ev.name, ev.pid, ev.up_rate, ev.sustained_secs, ev.threshold_bps
+                    );
+                    let rec = crate::history::make_alert_record(
+                        now,
+                        tz_offset,
+                        &ev.name,
+                        ev.pid,
+                        &ev.exe_path,
+                        ev.up_rate,
+                        ev.threshold_bps,
+                        ev.sustained_secs,
+                    );
+                    if let Err(e) = crate::history::append_records(&hist_path, &[rec]) {
+                        tracing::warn!("failed to append alert history: {e}");
+                    }
+                }
+
+                // --- 历史累计观测与每 60 秒落盘 ---
+                let totals: Vec<(String, crate::history::ProcTotals)> = processes
+                    .iter()
+                    .map(|(k, p)| {
+                        (
+                            k.clone(),
+                            crate::history::ProcTotals {
+                                name: p.name.clone(),
+                                pid: p.pid,
+                                exe_path: p.exe_path.clone(),
+                                down_total: p.down_total,
+                                up_total: p.up_total,
+                            },
+                        )
+                    })
+                    .collect();
+                accumulator.observe(&totals);
+                if tick - last_flush_tick >= 60
+                    && flush_history(
+                        &mut accumulator,
+                        &hist_path,
+                        tz_offset,
+                        tick - last_flush_tick,
+                    )
+                {
+                    last_flush_tick = tick;
+                }
+                // 每天清理一次过期历史。
+                let today = now / 86_400;
+                if today != cleanup_day {
+                    cleanup_day = today;
+                    if let Err(e) = crate::history::cleanup_file(&hist_path, now) {
+                        tracing::warn!("history cleanup failed: {e}");
+                    }
+                }
+
+                // --- 横幅用的当前告警（最近触发的一个） ---
+                let active_alert = alert_engine
+                    .fired()
+                    .into_iter()
+                    .max_by_key(|f| f.fired_tick)
+                    .map(|f| crate::types::ActiveAlert {
+                        name: f.name.clone(),
+                        exe_path: f.exe_path.clone(),
+                        pid: f.pid,
+                        up_rate: processes.get(&f.key).map(|p| p.up_rate).unwrap_or(0),
+                        threshold_bps: f.threshold_bps,
+                        sustained_secs: tick.saturating_sub(f.above_since),
+                        triggered_at: crate::history::format_local_time(
+                            fired_wall.get(&f.key).copied().unwrap_or(now),
+                            tz_offset,
+                        ),
+                    });
+
                 let rules = shared.rules.lock().unwrap().clone();
                 let snapshot = Snapshot {
                     processes,
                     total_down_rate,
                     total_up_rate,
                     rules,
+                    alert_settings: alert_settings.clone(),
+                    active_alert,
                 };
                 if snapshot_tx.send(snapshot).is_err() {
                     // GUI receiver gone: nothing left to feed.
                     tracing::info!("aggregator: snapshot receiver dropped, stopping");
                     shared.running.store(false, Ordering::Relaxed);
+                    flush_history(
+                        &mut accumulator,
+                        &hist_path,
+                        tz_offset,
+                        tick - last_flush_tick,
+                    );
                     break;
                 }
             }
         }
     }
     tracing::info!("aggregator thread exiting");
+}
+
+/// 把累计器中尚未落盘的增量写入历史文件。成功返回 true 并推进基线；
+/// 失败只记日志，下个周期会连同新数据一并重试（平均速率按实际周期算）。
+fn flush_history(
+    accumulator: &mut crate::history::HistoryAccumulator,
+    hist_path: &std::path::Path,
+    tz_offset: i64,
+    period_secs: u64,
+) -> bool {
+    if period_secs == 0 {
+        return true;
+    }
+    let rows = accumulator.build_rows(now_unix(), tz_offset, period_secs);
+    if rows.is_empty() {
+        accumulator.mark_written();
+        return true;
+    }
+    match crate::history::append_records(hist_path, &rows) {
+        Ok(()) => {
+            accumulator.mark_written();
+            true
+        }
+        Err(e) => {
+            tracing::warn!("failed to append history: {e}");
+            false
+        }
+    }
+}
+
+/// 当前 unix 时间戳（秒）。
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 本机 UTC 偏移（秒）：本地时间 = UTC + 偏移。
+#[cfg(windows)]
+fn local_utc_offset_secs() -> i64 {
+    use windows::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
+    unsafe {
+        let mut tzi = TIME_ZONE_INFORMATION::default();
+        let id = GetTimeZoneInformation(&mut tzi);
+        // UTC = 本地时间 + Bias + 当前生效的附加偏差（分钟），
+        // 故本地偏移（秒）= -(Bias + 附加偏差) * 60。
+        // 返回值 2 = TIME_ZONE_ID_DAYLIGHT（夏令时生效中）。
+        let extra = if id == 2 {
+            tzi.DaylightBias
+        } else {
+            tzi.StandardBias
+        };
+        -((tzi.Bias + extra) as i64) * 60
+    }
+}
+
+#[cfg(not(windows))]
+fn local_utc_offset_secs() -> i64 {
+    0
 }

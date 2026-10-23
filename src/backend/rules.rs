@@ -75,6 +75,61 @@ pub fn save(rules: &HashMap<String, Rule>) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// 告警设置持久化（与 rules 相同的容错模式）：%APPDATA%\Throttle\settings.json
+// ---------------------------------------------------------------------------
+
+use crate::types::AlertSettings;
+
+/// Full path to the alert-settings file.
+pub fn settings_path() -> PathBuf {
+    config_dir().join("settings.json")
+}
+
+/// Load the persisted alert settings. Missing/corrupt file => defaults.
+pub fn load_settings() -> AlertSettings {
+    let path = settings_path();
+    let data = match std::fs::read_to_string(&path) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!("no settings file at {}, using defaults", path.display());
+            return AlertSettings::default();
+        }
+        Err(e) => {
+            tracing::warn!("failed to read {}: {e}", path.display());
+            return AlertSettings::default();
+        }
+    };
+    match serde_json::from_str::<AlertSettings>(&data) {
+        Ok(mut s) => {
+            // 归一化忽略名单，避免大小写/空白导致匹配失效。
+            s.ignore = s
+                .ignore
+                .iter()
+                .map(|e| e.trim().to_lowercase())
+                .filter(|e| !e.is_empty())
+                .collect();
+            tracing::info!("loaded alert settings from {}", path.display());
+            s
+        }
+        Err(e) => {
+            tracing::warn!("failed to parse {}: {e}; using defaults", path.display());
+            AlertSettings::default()
+        }
+    }
+}
+
+/// Persist the alert settings as pretty JSON, creating the directory if needed.
+pub fn save_settings(settings: &AlertSettings) -> anyhow::Result<()> {
+    let dir = config_dir();
+    std::fs::create_dir_all(&dir)?;
+    let path = settings_path();
+    let json = serde_json::to_string_pretty(settings)?;
+    std::fs::write(&path, json)?;
+    tracing::debug!("saved alert settings to {}", path.display());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +176,23 @@ mod tests {
         assert!(r.down_limit.is_none());
         assert!(r.up_limit.is_none());
         assert!(!r.blocked);
+    }
+
+    #[test]
+    fn alert_settings_round_trip_and_defaults() {
+        // 默认值：500 KB/s、30 秒、忽略名单为空。
+        let d = AlertSettings::default();
+        assert_eq!(d.up_threshold_bps, 500 * 1024);
+        assert_eq!(d.duration_secs, 30);
+        assert!(d.ignore.is_empty());
+
+        let s = AlertSettings {
+            up_threshold_bps: 1024,
+            duration_secs: 45,
+            ignore: vec!["a.exe".to_string(), "c:\\b.exe".to_string()],
+        };
+        let json = serde_json::to_string_pretty(&s).unwrap();
+        let back: AlertSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, back);
     }
 }

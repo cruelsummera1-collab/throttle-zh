@@ -10,12 +10,13 @@
     windows_subsystem = "windows"
 )]
 
+mod alert;
 mod backend;
 mod gui;
+mod history;
 mod icon;
 mod single_instance;
 mod types;
-mod update_check;
 
 use crossbeam_channel::unbounded;
 
@@ -38,23 +39,12 @@ fn main() -> eframe::Result {
     // every packet and undermine the first one's limits. This runs before the
     // log file is opened, because opening it truncates the running instance's
     // log. The lock is held until the process exits.
-    //
-    // After a self-update the new build is launched while the old one is still
-    // shutting down; wait for it so the lock is free and its rules are saved.
-    if let Some(pid) = std::env::args()
-        .skip_while(|a| a != "--wait-pid")
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-    {
-        update_check::wait_for_pid(pid, std::time::Duration::from_secs(30));
-    }
     let _instance_lock = match single_instance::acquire() {
         Some(lock) => lock,
         None => return Ok(()),
     };
 
     setup_logging();
-    update_check::cleanup_old_exe();
 
     // Panics in worker threads are otherwise invisible (no console): log them.
     std::panic::set_hook(Box::new(|info| {
@@ -135,7 +125,7 @@ fn main() -> eframe::Result {
             .with_inner_size([1100.0, 720.0])
             .with_min_inner_size([720.0, 480.0])
             .with_icon(app_icon)
-            .with_title("Throttle"),
+            .with_title("流量监控"),
         ..Default::default()
     };
 
@@ -148,7 +138,7 @@ fn main() -> eframe::Result {
             // running.
             tracing::info!("backend started; launching GUI");
             let result = eframe::run_native(
-                "Throttle",
+                "流量监控",
                 native_options,
                 Box::new(move |cc| Ok(Box::new(gui::ThrottleApp::new(cc, snapshot_rx, cmd_tx)))),
             );
@@ -163,7 +153,7 @@ fn main() -> eframe::Result {
             let message = format!("{err:#}");
             // Show the error in a minimal window instead of exiting silently.
             eframe::run_native(
-                "Throttle error",
+                "流量监控 - 启动失败",
                 native_options,
                 Box::new(move |_cc| Ok(Box::new(gui::ErrorApp::new(message.clone())))),
             )

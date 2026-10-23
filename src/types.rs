@@ -42,6 +42,45 @@ pub struct ProcessStats {
     pub flow_count: usize,
 }
 
+/// 异常上传提醒设置（持久化到数据目录的 `settings.json`）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AlertSettings {
+    /// 单进程上传速率阈值（字节/秒）；0 表示关闭提醒。
+    pub up_threshold_bps: u64,
+    /// 连续达到阈值的秒数才触发提醒。
+    pub duration_secs: u32,
+    /// 忽略名单：进程名或完整路径（不区分大小写）；默认为空，
+    /// 不预置任何程序（包括爱奇艺等可能需要检查的程序）。
+    pub ignore: Vec<String>,
+}
+
+impl Default for AlertSettings {
+    fn default() -> Self {
+        Self {
+            // 500 KB/s（500 × 1024 字节/秒），与界面速率显示同为 1024 进制。
+            up_threshold_bps: 500 * 1024,
+            duration_secs: 30,
+            ignore: Vec::new(),
+        }
+    }
+}
+
+/// 当前正在持续（已触发且尚未恢复）的上传告警，供界面横幅展示。
+#[derive(Debug, Clone, Default)]
+pub struct ActiveAlert {
+    pub name: String,
+    pub exe_path: String,
+    pub pid: u32,
+    /// 当前上传速率（字节/秒）。
+    pub up_rate: u64,
+    /// 触发阈值（字节/秒）。
+    pub threshold_bps: u64,
+    /// 已持续秒数（自首次达标起算）。
+    pub sustained_secs: u64,
+    /// 触发时刻的本地时间字符串。
+    pub triggered_at: String,
+}
+
 /// Snapshot of everything the GUI needs, produced ~1x/sec by the backend.
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
@@ -52,6 +91,10 @@ pub struct Snapshot {
     pub total_up_rate: u64,
     /// Currently active rules, keyed by lowercase exe_path.
     pub rules: HashMap<String, Rule>,
+    /// 当前生效的异常上传提醒设置。
+    pub alert_settings: AlertSettings,
+    /// 正在持续的上传告警（最近触发的一个）；无告警时为 None。
+    pub active_alert: Option<ActiveAlert>,
 }
 
 /// Commands sent from the GUI to the backend.
@@ -61,6 +104,8 @@ pub enum Command {
     SetRule(Rule),
     /// Remove any rule for this lowercase exe path.
     RemoveRule(String),
+    /// Replace the alert settings and persist them.
+    SetAlertSettings(AlertSettings),
     /// Stop the engine threads and flush state (app exit).
     Shutdown,
 }

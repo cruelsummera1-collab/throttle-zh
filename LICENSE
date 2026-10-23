@@ -22,9 +22,32 @@ SOFTWARE.
 
 ---
 
-This product bundles WinDivert (WinDivert.dll, WinDivert64.sys, and its import
-library and headers under vendor/), which is a separate work licensed under the
-GNU Lesser General Public License v3 (with a dual GPL/proprietary option).
-Throttle links to WinDivert dynamically and ships it as a separate, replaceable
-component; it is not statically linked into the Throttle binary. See
-vendor/WinDivert-2.2.2-A/LICENSE for its full terms.
+This product bundles WinDivert 2.2.2 (WinDivert.dll, WinDivert64.sys, and its
+import library and headers under vendor/), which is a separate work
+dual-licensed under your choice of the GNU Lesser General Public License
+(LGPL) Version 3 or the GNU General Public License (GPL) Version 2; this
+project distributes it under the LGPL v3 choice. Throttle links to WinDivert
+dynamically (the DLL is loaded at runtime) and ships it as separate,
+replaceable files; the WinDivert library is not statically linked into the
+Throttle binary. The Rust binding crates used to call WinDivert (windivert
+0.6.0 and windivert-sys 0.10.0, LGPL-3.0-or-later) are compiled into the
+binary as Rust code; their source ships with this project's source
+distribution. See vendor/WinDivert-2.2.2-A/LICENSE for WinDivert's full terms.
+
+[Wording note: the bundling note above corrects a factual error in the
+upstream v0.1.2 LICENSE, which described WinDivert as "LGPL v3 (with a dual
+GPL/proprietary option)". WinDivert's own LICENSE (first lines) and README
+state the dual license is a choice between LGPL v3 and GPL v2 only; no
+proprietary/commercial option is part of that dual license. The MIT License
+text above is unchanged.]
+
+---
+
+Modifications and additions made in this fork — the Simplified Chinese
+localization, the local history recording, the sustained-upload alert feature,
+and the removal of the self-update mechanism — are:
+
+Copyright (c) 2026 本项目维护者
+
+and are licensed under the MIT License above. The copyright notice of the
+original author above remains unchanged and applies to the original work.

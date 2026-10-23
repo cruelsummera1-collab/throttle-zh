@@ -124,6 +124,31 @@ pub fn notify_alert(name: &str, pid: u32, up_rate: u64, sustained_secs: u64, thr
     }
 }
 
+/// 发送一条通用系统通知（与告警弹窗同一通道、同一发送方式）：
+/// 目前用于「首次缩到系统托盘」的提示。失败只记日志。
+/// 非 Windows 平台为空操作。
+pub fn notify_message(title: &str, body: &str) {
+    #[cfg(windows)]
+    {
+        let title = title.to_string();
+        let body = body.to_string();
+        let spawned = std::thread::Builder::new()
+            .name("message-toast".to_string())
+            .spawn(move || {
+                if let Err(e) = win::show_toast(&title, &body) {
+                    tracing::warn!("系统通知发送失败（不影响主流程）：{e}");
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!("系统通知线程创建失败（不影响主流程）：{e}");
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (title, body);
+    }
+}
+
 /// 程序启动时调用一次：为系统通知做准备（设置进程 AUMID、检查/补建
 /// 开始菜单快捷方式）。失败只记日志，绝不影响主流程。
 /// 非 Windows 平台为空操作。

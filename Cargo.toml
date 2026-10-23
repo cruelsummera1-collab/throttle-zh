@@ -27,3 +27,16 @@ winresource = "0.1.31"
 [target."cfg(windows)".dependencies]
 winreg = "0.56.0"
 winrt-toast = "0.1.1"
+tray-icon = "0.21"
+
+# 发布构建：压缩 exe 体积与常驻代码页（strip 掉符号表、LTO、单代码
+# 生成单元、按体积优化）。panic 保持默认 unwind 而非 abort：后端工作
+# 线程的 panic 在设计上只记日志（main.rs 的 panic hook），且 names.rs
+# 等处对 Mutex 中毒做了解毒恢复——改成 abort 会把单线程 panic 变成
+# 整进程退出，属用户可见行为变化，收益（省下展开表）也多被 strip
+# 覆盖，故不启用。
+[profile.release]
+strip = true
+lto = "fat"
+codegen-units = 1
+opt-level = "s"

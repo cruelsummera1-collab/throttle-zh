@@ -339,6 +339,9 @@ impl FlowTable {
                     up_rate,
                     down_total: c.down_total,
                     up_total: c.up_total,
+                    // 历史总累计由聚合线程在快照后统一填入（此处占位）。
+                    history_down_total: 0,
+                    history_up_total: 0,
                     down_history: c.down_history.clone(),
                     up_history: c.up_history.clone(),
                     flow_count: flow_counts.get(exe).copied().unwrap_or(0),

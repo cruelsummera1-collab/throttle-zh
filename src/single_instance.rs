@@ -10,12 +10,14 @@
 use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, IsIconic, SW_RESTORE, SetForegroundWindow, ShowWindow,
+    FindWindowW, IsIconic, IsWindowVisible, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow,
 };
 use windows::core::{PCWSTR, w};
 
 /// Title of the main window, used to locate an already-running instance.
-const WINDOW_TITLE: PCWSTR = w!("Throttle");
+/// 注意：主窗口标题自中文化后是「流量监控」，必须与 main.rs 里
+/// ViewportBuilder::with_title 的值保持一致，否则找不到已有窗口。
+const WINDOW_TITLE: PCWSTR = w!("流量监控");
 
 /// Held for the life of the process. Dropping it would release the mutex, so
 /// the handle is intentionally never closed.
@@ -43,6 +45,9 @@ pub fn acquire() -> Option<InstanceLock> {
 }
 
 /// Best-effort: restore and raise the existing instance's main window.
+/// 已有实例可能处于三种状态：正常显示、最小化、或缩在系统托盘里
+/// （窗口被隐藏）——隐藏状态先用 SW_SHOW 把窗口显出来再置前台；
+/// GUI 侧还会凭焦点事件对齐它自己的隐藏标记。
 fn focus_existing_window() {
     // SAFETY: FindWindowW returns a null HWND when nothing matches; all calls
     // tolerate that and return failure rather than faulting.
@@ -53,6 +58,9 @@ fn focus_existing_window() {
         };
         if IsIconic(hwnd).as_bool() {
             let _ = ShowWindow(hwnd, SW_RESTORE);
+        } else if !IsWindowVisible(hwnd).as_bool() {
+            // 缩在托盘里的隐藏窗口：FindWindowW 能找到但不可见。
+            let _ = ShowWindow(hwnd, SW_SHOW);
         }
         let _ = SetForegroundWindow(hwnd);
     }

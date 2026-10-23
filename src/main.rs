@@ -12,13 +12,19 @@
 
 mod alert;
 mod backend;
+mod fontdata;
 mod gui;
 mod history;
 mod icon;
 mod names;
 mod notify;
+mod prefs;
 mod single_instance;
 mod startup;
+mod totals;
+mod tray;
+#[cfg(windows)]
+mod trayicon;
 mod types;
 
 use crossbeam_channel::unbounded;

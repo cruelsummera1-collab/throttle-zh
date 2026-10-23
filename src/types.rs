@@ -37,6 +37,10 @@ pub struct ProcessStats {
     /// Total bytes since start.
     pub down_total: u64,
     pub up_total: u64,
+    /// 历史总累计（跨运行，由 `crate::totals` 按分钟增量折入落盘后，
+    /// 聚合线程在每秒快照时填入“已落盘 + 本次未折入增量”的显示值）。
+    pub history_down_total: u64,
+    pub history_up_total: u64,
     /// Rolling per-second download rates, newest last, up to HISTORY_LEN.
     pub down_history: Vec<u64>,
     /// Rolling per-second upload rates, newest last, up to HISTORY_LEN.
@@ -94,6 +98,14 @@ pub struct Snapshot {
     /// Total current rates across all processes, bytes/sec.
     pub total_down_rate: u64,
     pub total_up_rate: u64,
+    /// 本次运行全进程累计之和（后端聚合，含“系统”“未归属流量”行，
+    /// 与进程表全部行的本次累计口径一致；GUI 只展示不自行求和）。
+    pub grand_down_total: u64,
+    pub grand_up_total: u64,
+    /// 历史总累计的全进程之和（totals 落盘值 + 本次未折入增量，
+    /// 含本次运行未出现的进程；后端聚合，GUI 只展示）。
+    pub history_grand_down_total: u64,
+    pub history_grand_up_total: u64,
     /// Currently active rules, keyed by lowercase exe_path.
     pub rules: HashMap<String, Rule>,
     /// 当前生效的异常上传提醒设置。
@@ -111,6 +123,9 @@ pub enum Command {
     RemoveRule(String),
     /// Replace the alert settings and persist them.
     SetAlertSettings(AlertSettings),
+    /// 清零历史总累计（totals.json），立即生效并落盘；不动每分钟
+    /// 历史记录与告警事件。
+    ResetTotals,
     /// Stop the engine threads and flush state (app exit).
     Shutdown,
 }

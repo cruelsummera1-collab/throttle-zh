@@ -168,10 +168,15 @@ impl<P: MetadataProvider> NameResolver<P> {
             None
         };
         let chosen = choose_display_name(exe_name, meta.as_ref());
-        self.cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key, chosen.clone());
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        // 安全阀：条目数按不同 exe 路径的基数自然有界，但极端情况下
+        // （大量短命程序的不同路径）也不无限增长；清掉后按需重新
+        // 解析，结果与缓存命中完全一致。
+        const MAX_CACHE_ENTRIES: usize = 1024;
+        if cache.len() >= MAX_CACHE_ENTRIES && !cache.contains_key(&key) {
+            cache.clear();
+        }
+        cache.insert(key, chosen.clone());
         chosen
     }
 

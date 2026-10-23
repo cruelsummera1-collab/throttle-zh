@@ -4,6 +4,7 @@
 //! This file is built against the shared contract in `crate::types` and must
 //! not depend on any backend internals beyond the `snapshot_rx` receiver.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
@@ -192,6 +193,26 @@ fn install_chinese_fonts(ctx: &egui::Context) {
         if !magic_ok {
             continue;
         }
+        // 内存优化：TTC（如微软雅黑）整包读入后，epaint 只用其中索引
+        // 为 0 的第一个字重（FontData::from_owned 的 index 恒为 0），
+        // 其余字重的字节却会一直常驻。先把首字重提取为独立字体再
+        // 交给 egui，常驻量只剩实际用到的字重，字形逐字节一致、
+        // 渲染效果不变；提取失败则回退整包字节（行为与原先相同）。
+        let bytes = if bytes.starts_with(b"ttcf") {
+            match crate::fontdata::first_face(&bytes) {
+                Some(face) => {
+                    tracing::info!(
+                        "已提取 TTC 首字重：{} → {} 字节",
+                        bytes.len(),
+                        face.len()
+                    );
+                    face
+                }
+                None => bytes,
+            }
+        } else {
+            bytes
+        };
         let mut fonts = egui::FontDefinitions::default();
         fonts.font_data.insert(
             "zh_fallback".to_owned(),
@@ -221,6 +242,8 @@ enum SortColumn {
     Up,
     DownTotal,
     UpTotal,
+    HistoryDownTotal,
+    HistoryUpTotal,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -266,7 +289,9 @@ pub struct ThrottleApp {
     snapshot_rx: Receiver<Snapshot>,
     cmd_tx: Sender<Command>,
 
-    last_snapshot: Snapshot,
+    /// 最近一帧快照：用 Arc 共享，避免每帧绘制时整表深克隆
+    /// （进程表含每进程 2×60 个速率样本与多条字符串，是内存大户）。
+    last_snapshot: Arc<Snapshot>,
     total_down_hist: Vec<f64>,
     total_up_hist: Vec<f64>,
 
@@ -287,6 +312,23 @@ pub struct ThrottleApp {
     startup_note: Option<(String, bool)>,
     history_open: bool,
     history_rows: Vec<HistoryRecord>,
+    /// 「清零历史累计」的待确认状态（历史窗口内二次确认，不用系统弹窗）。
+    history_reset_confirm: bool,
+
+    /// 界面偏好存储（托盘开关、首次提示标记），落盘 gui-prefs.json。
+    prefs_store: crate::prefs::PrefsStore,
+    /// 托盘句柄（Windows）：必须一直持有，Drop 即移除托盘图标；
+    /// 创建失败为 None，此时关闭窗口兜底为真退出（无托盘可缩）。
+    #[cfg(windows)]
+    tray: Option<crate::trayicon::TrayHandle>,
+    #[cfg(windows)]
+    tray_init_tried: bool,
+    /// 主窗口当前处于托盘隐藏状态（不绘制，只低频轮询托盘动作）。
+    window_hidden: bool,
+    /// 明确退出已发起（托盘右键菜单/文件菜单的退出）：关闭拦截放行。
+    quitting: bool,
+    /// 设置窗口「后台运行」一节的操作提示（文字 + 是否为错误）。
+    tray_note: Option<(String, bool)>,
 }
 
 impl ThrottleApp {
@@ -296,10 +338,24 @@ impl ThrottleApp {
         cmd_tx: Sender<Command>,
     ) -> Self {
         install_chinese_fonts(&cc.egui_ctx);
+        // 界面偏好：文件不存在/损坏都用默认值（缩到托盘默认开启），
+        // 只记日志，绝不影响启动。
+        let (prefs_store, prefs_status) = crate::prefs::PrefsStore::load(
+            crate::prefs::prefs_path(&rules::config_dir()),
+        );
+        match prefs_status {
+            crate::prefs::LoadStatus::Loaded => {}
+            crate::prefs::LoadStatus::Fresh => {
+                tracing::info!("界面偏好文件不存在，使用默认值（关闭窗口时缩到托盘：开启）");
+            }
+            crate::prefs::LoadStatus::Corrupted => {
+                tracing::warn!("界面偏好文件损坏，已回退为默认值（关闭窗口时缩到托盘：开启）");
+            }
+        }
         Self {
             snapshot_rx,
             cmd_tx,
-            last_snapshot: Snapshot::default(),
+            last_snapshot: Arc::new(Snapshot::default()),
             total_down_hist: Vec::with_capacity(TOTAL_HISTORY_LEN),
             total_up_hist: Vec::with_capacity(TOTAL_HISTORY_LEN),
             sort_column: SortColumn::Down,
@@ -314,6 +370,15 @@ impl ThrottleApp {
             startup_note: None,
             history_open: false,
             history_rows: Vec::new(),
+            history_reset_confirm: false,
+            prefs_store,
+            #[cfg(windows)]
+            tray: None,
+            #[cfg(windows)]
+            tray_init_tried: false,
+            window_hidden: false,
+            quitting: false,
+            tray_note: None,
         }
     }
 
@@ -322,6 +387,70 @@ impl ThrottleApp {
             let _ = self.cmd_tx.send(Command::Shutdown);
             self.shutdown_sent = true;
         }
+    }
+
+    /// 「关闭窗口时缩到托盘」开关当前值（界面偏好，立即生效）。
+    fn minimize_to_tray(&self) -> bool {
+        self.prefs_store.prefs().minimize_to_tray
+    }
+
+    /// 托盘句柄是否可用。不可用（非 Windows，或创建失败）时关闭
+    /// 窗口绝不隐藏——没有托盘图标就无从恢复，必须兜底真退出。
+    fn tray_available(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.tray.is_some()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    /// 修改界面偏好并落盘；失败只记日志并返回 false（内存里的值
+    /// 已按新值生效，只是重启后会恢复旧值）。
+    fn save_prefs(&mut self, prefs: crate::prefs::GuiPrefs) -> bool {
+        match self.prefs_store.update(prefs) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("界面偏好保存失败（不影响监控）：{e}");
+                false
+            }
+        }
+    }
+
+    /// 把主窗口隐藏到系统托盘，后端继续监控。本版本第一次隐藏时
+    /// 发一条系统通知说明怎么恢复/退出，并把「已提示」记入偏好，
+    /// 之后不再打扰。
+    fn hide_to_tray(&mut self, ctx: &egui::Context) {
+        self.window_hidden = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        tracing::info!("主窗口已缩到系统托盘，后台继续监控");
+        if !self.prefs_store.prefs().tray_hint_shown {
+            let mut prefs = self.prefs_store.prefs().clone();
+            prefs.tray_hint_shown = true;
+            self.save_prefs(prefs);
+            crate::notify::notify_message(
+                "流量监控",
+                "已缩到系统托盘继续监控。左键点托盘图标恢复窗口，右键选「退出程序」彻底退出。",
+            );
+        }
+    }
+
+    /// 从托盘恢复主窗口：显示、取消最小化、置前台。
+    fn show_from_tray(&mut self, ctx: &egui::Context) {
+        self.window_hidden = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    /// 发起真正退出：先立「明确退出」标记再发关闭命令，关闭请求
+    /// 到达时拦截逻辑会放行，走与旧版完全相同的退出路径
+    /// （send_shutdown → 后端落盘收尾 → 驱动随进程退出卸载）。
+    fn request_quit(&mut self, ctx: &egui::Context) {
+        self.quitting = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
     /// The current rule for `key`, or a fresh default rule bound to that path.
@@ -446,7 +575,9 @@ impl ThrottleApp {
                     }
                     ui.separator();
                     if ui.button("退出").clicked() {
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        // 菜单里的「退出」是明确退出：即使开着缩到托盘
+                        // 也真退出，不被关闭拦截改成隐藏。
+                        self.request_quit(ui.ctx());
                         ui.close();
                     }
                 });
@@ -574,6 +705,7 @@ impl ThrottleApp {
         // 开机自启动状态每次打开窗口都实时读注册表，不用缓存。
         self.refresh_startup_status();
         self.startup_note = None;
+        self.tray_note = None;
         let s = &self.last_snapshot.alert_settings;
         let (value, unit) = if s.up_threshold_bps == 0 {
             (0.0, RateUnit::KBps)
@@ -612,6 +744,14 @@ impl ThrottleApp {
         let startup_note = self.startup_note.clone();
         #[cfg(windows)]
         let mut startup_action: Option<StartupAction> = None;
+        // 「后台运行」一节与开机启动同模式：读的是偏好里的实时值，
+        // 勾选动作先记下来，窗口画完再落盘并回写提示。
+        #[cfg(windows)]
+        let tray_minimize_checked = self.prefs_store.prefs().minimize_to_tray;
+        #[cfg(windows)]
+        let tray_note = self.tray_note.clone();
+        #[cfg(windows)]
+        let mut tray_toggle: Option<bool> = None;
         egui::Window::new("异常上传提醒设置")
             .collapsible(false)
             .resizable(false)
@@ -734,6 +874,36 @@ impl ThrottleApp {
                         }
                     }
                 }
+                #[cfg(windows)]
+                {
+                    ui.separator();
+                    ui.label(egui::RichText::new("后台运行").strong());
+                    ui.label(
+                        egui::RichText::new(
+                            "开启后，点窗口右上角 × 只是把窗口收进系统托盘，\
+                             后台继续抓包、提醒与历史累计；左键点托盘图标恢复窗口，\
+                             彻底退出请用托盘右键菜单的「退出程序」。\
+                             关闭此开关后，× 恢复为直接退出。\
+                             此开关立即生效，不用点“保存”；设置保存在 gui-prefs.json。",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                    let mut checked = tray_minimize_checked;
+                    if ui
+                        .checkbox(&mut checked, "关闭窗口时缩到托盘（后台继续监控）")
+                        .changed()
+                    {
+                        tray_toggle = Some(checked);
+                    }
+                    if let Some((note, is_error)) = &tray_note {
+                        if *is_error {
+                            ui.colored_label(COLOR_BLOCK, note);
+                        } else {
+                            ui.label(note);
+                        }
+                    }
+                }
                 if let Some(err) = &draft.error {
                     ui.colored_label(COLOR_BLOCK, err);
                 }
@@ -751,6 +921,28 @@ impl ThrottleApp {
         #[cfg(windows)]
         if let Some(action) = startup_action {
             self.apply_startup_action(action);
+        }
+
+        #[cfg(windows)]
+        if let Some(enabled) = tray_toggle {
+            let mut prefs = self.prefs_store.prefs().clone();
+            prefs.minimize_to_tray = enabled;
+            if self.save_prefs(prefs) {
+                self.tray_note = Some((
+                    if enabled {
+                        "已开启：关闭窗口将缩到系统托盘，后台继续监控。".to_string()
+                    } else {
+                        "已关闭：关闭窗口将直接退出程序。".to_string()
+                    },
+                    false,
+                ));
+            } else {
+                self.tray_note = Some((
+                    "保存设置失败（详见日志）：本次运行已按新设置生效，重启后会恢复旧设置。"
+                        .to_string(),
+                    true,
+                ));
+            }
         }
 
         if cancel || !open {
@@ -800,6 +992,7 @@ impl ThrottleApp {
     fn open_history(&mut self) {
         self.history_rows =
             history::read_recent(&history::history_path(&rules::config_dir()), 500);
+        self.history_reset_confirm = false;
         self.history_open = true;
     }
 
@@ -834,6 +1027,45 @@ impl ThrottleApp {
                     .weak()
                     .small(),
                 );
+                {
+                    // 历史总计（后端快照提供，含本次运行未出现的进程）。
+                    let hd = self.last_snapshot.history_grand_down_total;
+                    let hu = self.last_snapshot.history_grand_up_total;
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "历史总下载 {} · 历史总上传 {} · 历史合计 {}",
+                            humanize_bytes(hd),
+                            humanize_bytes(hu),
+                            humanize_bytes(hd.saturating_add(hu)),
+                        ))
+                        .strong(),
+                    );
+                }
+                ui.horizontal(|ui| {
+                    if self.history_reset_confirm {
+                        ui.label(
+                            egui::RichText::new("确定要清零全部进程的历史累计吗？")
+                                .color(COLOR_BLOCK),
+                        );
+                        if ui.button("确认清零").clicked() {
+                            let _ = self.cmd_tx.send(Command::ResetTotals);
+                            self.history_reset_confirm = false;
+                        }
+                        if ui.button("取消").clicked() {
+                            self.history_reset_confirm = false;
+                        }
+                    } else if ui.button("清零历史累计").clicked() {
+                        self.history_reset_confirm = true;
+                    }
+                    ui.label(
+                        egui::RichText::new(
+                            "历史累计：各进程自累计以来的总下载/上传，主表“历史累计下载/上传”两列即此数，\
+                             跨重启保留（totals.json）；清零只清这一项，不影响每分钟记录与告警事件。",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                });
                 ui.separator();
                 ui.heading("告警事件");
                 let alerts: Vec<&HistoryRecord> = self
@@ -892,6 +1124,10 @@ impl ThrottleApp {
                     });
             });
         self.history_open = open;
+        if !open {
+            // 窗口关掉时丢弃未完成的清零待确认状态。
+            self.history_reset_confirm = false;
+        }
     }
 
     fn draw_about(&mut self, ctx: &egui::Context) {
@@ -973,6 +1209,22 @@ impl ThrottleApp {
                     );
                     ui.separator();
                     ui.label(format!("{} 个进程", snap.processes.len()));
+                    ui.separator();
+                    ui.label(format!(
+                        "总下载 {}",
+                        humanize_bytes(snap.grand_down_total)
+                    ));
+                    ui.label(format!(
+                        "总上传 {}",
+                        humanize_bytes(snap.grand_up_total)
+                    ));
+                    ui.label(format!(
+                        "合计 {}",
+                        humanize_bytes(
+                            snap.grand_down_total
+                                .saturating_add(snap.grand_up_total)
+                        )
+                    ));
                 });
 
                 // Let the plot fill the panel's remaining height rather than
@@ -1057,6 +1309,12 @@ impl ThrottleApp {
                         ui.label("累计上传（本次运行）");
                         ui.label(humanize_bytes(stats.up_total));
                         ui.end_row();
+                        ui.label("历史累计下载");
+                        ui.label(humanize_bytes(stats.history_down_total));
+                        ui.end_row();
+                        ui.label("历史累计上传");
+                        ui.label(humanize_bytes(stats.history_up_total));
+                        ui.end_row();
                         ui.label("规则");
                         ui.label(rule_summary(snap.rules.get(&key)));
                         ui.end_row();
@@ -1107,17 +1365,23 @@ impl ThrottleApp {
                 SortColumn::Up => a.up_rate.cmp(&b.up_rate),
                 SortColumn::DownTotal => a.down_total.cmp(&b.down_total),
                 SortColumn::UpTotal => a.up_total.cmp(&b.up_total),
+                SortColumn::HistoryDownTotal => {
+                    a.history_down_total.cmp(&b.history_down_total)
+                }
+                SortColumn::HistoryUpTotal => a.history_up_total.cmp(&b.history_up_total),
             };
             if sort_desc { ord.reverse() } else { ord }
         });
 
-        const SORT_COLUMN_LABELS: [(SortColumn, &str); 6] = [
+        const SORT_COLUMN_LABELS: [(SortColumn, &str); 8] = [
             (SortColumn::Name, "进程"),
             (SortColumn::Flows, "连接"),
             (SortColumn::Down, "下载"),
             (SortColumn::Up, "上传"),
             (SortColumn::DownTotal, "累计下载"),
             (SortColumn::UpTotal, "累计上传"),
+            (SortColumn::HistoryDownTotal, "历史累计下载"),
+            (SortColumn::HistoryUpTotal, "历史累计上传"),
         ];
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -1127,7 +1391,7 @@ impl ThrottleApp {
                 .striped(true)
                 .sense(egui::Sense::CLICK | egui::Sense::HOVER)
                 .column(egui_extras::Column::remainder().at_least(200.)) // Name
-                .columns(egui_extras::Column::auto(), 5) // Numeric
+                .columns(egui_extras::Column::auto(), 7) // Numeric
                 .column(egui_extras::Column::remainder()) // Rule
                 .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                 .header(20., |mut row| {
@@ -1170,13 +1434,15 @@ impl ThrottleApp {
             egui::RichText::new(summary)
         };
 
-        let cells: [egui::RichText; 7] = [
+        let cells: [egui::RichText; 9] = [
             egui::RichText::new(shown_process_name(stats)),
             egui::RichText::new(stats.flow_count.to_string()),
             egui::RichText::new(humanize_rate(stats.down_rate)).color(COLOR_DOWN),
             egui::RichText::new(humanize_rate(stats.up_rate)).color(COLOR_UP),
             egui::RichText::new(humanize_bytes(stats.down_total)),
             egui::RichText::new(humanize_bytes(stats.up_total)),
+            egui::RichText::new(humanize_bytes(stats.history_down_total)),
+            egui::RichText::new(humanize_bytes(stats.history_up_total)),
             rule_text,
         ];
         row.set_selected(selected);
@@ -1343,8 +1609,22 @@ impl eframe::App for ThrottleApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
+        // 托盘在首帧创建（此时事件循环已在运行）。创建失败只记日志：
+        // 本次运行没有托盘，关闭窗口兜底为真退出，不影响监控。
+        #[cfg(windows)]
+        if !self.tray_init_tried {
+            self.tray_init_tried = true;
+            match crate::trayicon::TrayHandle::new() {
+                Ok(handle) => self.tray = Some(handle),
+                Err(e) => {
+                    tracing::warn!("{e}；本次运行无系统托盘，关闭窗口将直接退出");
+                }
+            }
+        }
+
         // Drain any pending snapshots each frame.
         let incoming: Vec<Snapshot> = self.snapshot_rx.try_iter().collect();
+        let had_snapshot = !incoming.is_empty();
         for snap in incoming {
             self.total_down_hist.push(snap.total_down_rate as f64);
             self.total_up_hist.push(snap.total_up_rate as f64);
@@ -1356,12 +1636,70 @@ impl eframe::App for ThrottleApp {
                 let excess = self.total_up_hist.len() - TOTAL_HISTORY_LEN;
                 self.total_up_hist.drain(0..excess);
             }
-            self.last_snapshot = snap;
+            self.last_snapshot = Arc::new(snap);
         }
 
-        // Window close -> tell the backend to shut down.
+        // 托盘悬停提示跟随最新总速率刷新（快照约每秒一帧）。
+        #[cfg(windows)]
+        if had_snapshot {
+            if let Some(tray) = &self.tray {
+                tray.set_tooltip(&crate::tray::tooltip_text(
+                    self.last_snapshot.total_down_rate,
+                    self.last_snapshot.total_up_rate,
+                ));
+            }
+        }
+
+        // 托盘动作轮询：左键/双击/菜单「打开」恢复窗口，
+        // 菜单「退出程序」走真退出。
+        #[cfg(windows)]
+        {
+            let actions = self
+                .tray
+                .as_ref()
+                .map(|t| t.poll_actions())
+                .unwrap_or_default();
+            for action in actions {
+                match action {
+                    crate::tray::TrayAction::ShowWindow => self.show_from_tray(&ctx),
+                    crate::tray::TrayAction::Quit => self.request_quit(&ctx),
+                    crate::tray::TrayAction::None => {}
+                }
+            }
+        }
+
+        // 单实例唤起对齐：窗口藏在托盘里时，用户再次双击 exe，
+        // 第二实例会通过 Win32 直接把窗口显示并置前台
+        // （single_instance::focus_existing_window），焦点事件随之
+        // 到达——据此清掉隐藏标记恢复正常绘制，避免窗口已显示却
+        // 不再刷新的状态不一致。
+        if self.window_hidden && ctx.input(|i| i.viewport().focused) == Some(true) {
+            self.window_hidden = false;
+            tracing::info!("主窗口被再次启动唤起，恢复显示");
+        }
+
+        // Window close -> 按偏好缩到托盘，或真退出（通知后端收尾）。
         if ctx.input(|i| i.viewport().close_requested()) {
-            self.send_shutdown();
+            let hide = matches!(
+                crate::tray::close_action(self.minimize_to_tray(), self.quitting),
+                crate::tray::CloseAction::HideToTray
+            ) && self.tray_available();
+            if hide {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                if !self.window_hidden {
+                    self.hide_to_tray(&ctx);
+                }
+            } else {
+                self.send_shutdown();
+            }
+        }
+
+        // 隐藏在托盘里：不绘制任何界面（省 CPU），只以约 1 秒的
+        // 低频帧排干快照、轮询托盘动作与上面的唤起对齐。后端抓包、
+        // 告警、弹窗与累计都在后端线程里进行，不受影响。
+        if self.window_hidden {
+            ctx.request_repaint_after(Duration::from_millis(1000));
+            return;
         }
 
         let snap = self.last_snapshot.clone();

@@ -91,7 +91,9 @@ pub fn start(cmd_rx: Receiver<Command>) -> anyhow::Result<Backend> {
         running: AtomicBool::new(true),
     });
 
-    let (snapshot_tx, snapshot_rx) = crossbeam_channel::unbounded::<Snapshot>();
+    // 有界通道（容量 2）：界面只展示最新一帧，GUI 卡顿时旧快照无需
+    // 排队堆积；聚合线程用 try_send，满时丢弃当秒快照（见 run_aggregator）。
+    let (snapshot_tx, snapshot_rx) = crossbeam_channel::bounded::<Snapshot>(2);
 
     let mut handles = Vec::with_capacity(3);
 
@@ -224,6 +226,24 @@ fn run_aggregator(shared: Arc<Shared>, cmd_rx: Receiver<Command>, snapshot_tx: S
         tracing::warn!("history cleanup failed: {e}");
     }
     let mut accumulator = crate::history::HistoryAccumulator::new();
+    // --- 历史总累计（totals.json，独立于 30 天历史，口径见 crate::totals）---
+    let totals_path = crate::totals::totals_path(&rules::config_dir());
+    let (mut totals_store, totals_status) = crate::totals::TotalsStore::load(&totals_path);
+    match totals_status {
+        crate::totals::LoadStatus::Loaded => {
+            tracing::info!("已加载历史总累计：{}", totals_path.display());
+        }
+        crate::totals::LoadStatus::Fresh => {
+            tracing::info!("历史总累计文件不存在，从 0 开始累计");
+        }
+        crate::totals::LoadStatus::Corrupted => {
+            tracing::warn!(
+                "历史总累计文件损坏，已从 0 重新累计：{}",
+                totals_path.display()
+            );
+        }
+    }
+    let mut last_totals_tick: u64 = 0;
     let mut alert_settings = rules::load_settings();
     let mut alert_engine = crate::alert::AlertEngine::new(
         alert_settings.up_threshold_bps,
@@ -287,6 +307,14 @@ fn run_aggregator(shared: Arc<Shared>, cmd_rx: Receiver<Command>, snapshot_tx: S
                             tracing::warn!("failed to persist alert settings: {e}");
                         }
                     }
+                    Ok(Command::ResetTotals) => {
+                        // 清零历史总累计并立即落盘（只动 totals.json）。
+                        totals_store.reset();
+                        if let Err(e) = totals_store.save(&totals_path) {
+                            tracing::warn!("failed to persist totals after reset: {e}");
+                        }
+                        tracing::info!("历史总累计已清零");
+                    }
                     Ok(Command::Shutdown) | Err(_) => {
                         // Explicit shutdown, or the GUI dropped the command sender.
                         tracing::info!("aggregator: shutting down");
@@ -298,6 +326,11 @@ fn run_aggregator(shared: Arc<Shared>, cmd_rx: Receiver<Command>, snapshot_tx: S
                             tz_offset,
                             tick - last_flush_tick,
                         );
+                        // 历史总累计同样补折最后一分钟并落盘（尽力而为）。
+                        totals_store.fold();
+                        if let Err(e) = totals_store.save(&totals_path) {
+                            tracing::warn!("failed to persist totals on shutdown: {e}");
+                        }
                         let snapshot = shared.rules.lock().unwrap().clone();
                         if let Err(e) = rules::save(&snapshot) {
                             tracing::warn!("failed to persist rules on shutdown: {e}");
@@ -392,6 +425,19 @@ fn run_aggregator(shared: Arc<Shared>, cmd_rx: Receiver<Command>, snapshot_tx: S
                     })
                     .collect();
                 accumulator.observe(&totals);
+                // --- 历史总累计：同样的每秒观测，显示值在此填入快照 ---
+                // 显示值 = 已落盘总累计 + 本次运行尚未折入的增量，
+                // 口径与重复计数防护见 crate::totals 的模块注释。
+                let totals_obs: Vec<(String, u64, u64)> = totals
+                    .iter()
+                    .map(|(k, t)| (k.clone(), t.down_total, t.up_total))
+                    .collect();
+                totals_store.observe(&totals_obs);
+                for (k, p) in processes.iter_mut() {
+                    let (hd, hu) = totals_store.display(k);
+                    p.history_down_total = hd;
+                    p.history_up_total = hu;
+                }
                 if tick - last_flush_tick >= 60
                     && flush_history(
                         &mut accumulator,
@@ -401,6 +447,17 @@ fn run_aggregator(shared: Arc<Shared>, cmd_rx: Receiver<Command>, snapshot_tx: S
                     )
                 {
                     last_flush_tick = tick;
+                }
+                // 历史总累计与每分钟历史同节拍（60 秒）折入并落盘；
+                // 计时独立，历史落盘失败不影响总累计的折入节奏。
+                if tick - last_totals_tick >= 60 {
+                    totals_store.fold();
+                    match totals_store.save(&totals_path) {
+                        Ok(()) => last_totals_tick = tick,
+                        Err(e) => {
+                            tracing::warn!("failed to persist totals: {e}");
+                        }
+                    }
                 }
                 // 每天清理一次过期历史。
                 let today = now / 86_400;
@@ -433,26 +490,49 @@ fn run_aggregator(shared: Arc<Shared>, cmd_rx: Receiver<Command>, snapshot_tx: S
                         ),
                     });
 
+                // --- 全进程总计（后端聚合，GUI 只展示） ---
+                // 本次总计 = 进程表全部行（含合成行）的本次累计之和；
+                // 历史总计 = totals 存储的全部已知进程显示值之和。
+                let (grand_down_total, grand_up_total) =
+                    crate::totals::sum_run_totals(&totals_obs);
+                let (history_grand_down_total, history_grand_up_total) =
+                    totals_store.grand_display();
+
                 let rules = shared.rules.lock().unwrap().clone();
                 let snapshot = Snapshot {
                     processes,
                     total_down_rate,
                     total_up_rate,
+                    grand_down_total,
+                    grand_up_total,
+                    history_grand_down_total,
+                    history_grand_up_total,
                     rules,
                     alert_settings: alert_settings.clone(),
                     active_alert,
                 };
-                if snapshot_tx.send(snapshot).is_err() {
-                    // GUI receiver gone: nothing left to feed.
-                    tracing::info!("aggregator: snapshot receiver dropped, stopping");
-                    shared.running.store(false, Ordering::Relaxed);
-                    flush_history(
-                        &mut accumulator,
-                        &hist_path,
-                        tz_offset,
-                        tick - last_flush_tick,
-                    );
-                    break;
+                match snapshot_tx.try_send(snapshot) {
+                    Ok(()) => {}
+                    Err(crossbeam_channel::TrySendError::Full(_)) => {
+                        // GUI 正忙（拖动窗口等）：丢弃这一秒的快照。
+                        // 界面只展示最新一帧，监控与落盘不受影响。
+                    }
+                    Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                        // GUI receiver gone: nothing left to feed.
+                        tracing::info!("aggregator: snapshot receiver dropped, stopping");
+                        shared.running.store(false, Ordering::Relaxed);
+                        flush_history(
+                            &mut accumulator,
+                            &hist_path,
+                            tz_offset,
+                            tick - last_flush_tick,
+                        );
+                        totals_store.fold();
+                        if let Err(e) = totals_store.save(&totals_path) {
+                            tracing::warn!("failed to persist totals on stop: {e}");
+                        }
+                        break;
+                    }
                 }
             }
         }

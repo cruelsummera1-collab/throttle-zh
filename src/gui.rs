@@ -329,6 +329,13 @@ pub struct ThrottleApp {
     quitting: bool,
     /// 设置窗口「后台运行」一节的操作提示（文字 + 是否为错误）。
     tray_note: Option<(String, bool)>,
+
+    /// 内存自报（阶段 13）：最近一次本进程内存采样、「关于」窗口
+    /// 展示用；采样约每 3 秒刷新一次，另每 60 秒往日志记一行，
+    /// 让真机内存数字（工作集/私有提交）可跨版本回收对比。
+    mem_sample: Option<crate::meminfo::MemorySample>,
+    mem_sampled_at: Option<std::time::Instant>,
+    mem_logged_at: Option<std::time::Instant>,
 }
 
 impl ThrottleApp {
@@ -379,6 +386,9 @@ impl ThrottleApp {
             window_hidden: false,
             quitting: false,
             tray_note: None,
+            mem_sample: None,
+            mem_sampled_at: None,
+            mem_logged_at: None,
         }
     }
 
@@ -1167,6 +1177,12 @@ impl ThrottleApp {
                             .small(),
                     );
                     ui.end_row();
+                    ui.label("当前内存占用");
+                    ui.label(match &self.mem_sample {
+                        Some(s) => crate::meminfo::summary_line(s),
+                        None => "—".to_string(),
+                    });
+                    ui.end_row();
                 });
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -1639,6 +1655,32 @@ impl eframe::App for ThrottleApp {
             self.last_snapshot = Arc::new(snap);
         }
 
+        // 内存自报：约每 3 秒采样一次（供「关于」窗口显示），每 60 秒
+        // 往 throttle.log 记一行。放在托盘隐藏早退之前，缩到托盘时
+        // 也持续记录。采样失败/非 Windows 平台恒为 None，静默无显示。
+        {
+            let now = std::time::Instant::now();
+            let stale = self
+                .mem_sampled_at
+                .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(3));
+            if stale {
+                self.mem_sampled_at = Some(now);
+                if let Some(s) = crate::meminfo::sample() {
+                    self.mem_sample = Some(s);
+                    let log_due = self
+                        .mem_logged_at
+                        .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(60));
+                    if log_due {
+                        self.mem_logged_at = Some(now);
+                        tracing::info!(
+                            "内存占用（自报）：{}",
+                            crate::meminfo::summary_line(&s)
+                        );
+                    }
+                }
+            }
+        }
+
         // 托盘悬停提示跟随最新总速率刷新（快照约每秒一帧）。
         #[cfg(windows)]
         if had_snapshot {
@@ -1698,7 +1740,9 @@ impl eframe::App for ThrottleApp {
         // 低频帧排干快照、轮询托盘动作与上面的唤起对齐。后端抓包、
         // 告警、弹窗与累计都在后端线程里进行，不受影响。
         if self.window_hidden {
-            ctx.request_repaint_after(Duration::from_millis(1000));
+            ctx.request_repaint_after(Duration::from_millis(
+                crate::repaint::repaint_delay_ms(true, false),
+            ));
             return;
         }
 
@@ -1721,7 +1765,17 @@ impl eframe::App for ThrottleApp {
         self.draw_history(&ctx);
         self.draw_about(&ctx);
 
-        ctx.request_repaint_after(Duration::from_millis(500));
+        // 重绘节律（阶段 13）：有输入时 100 ms 跟手，空闲时 1000 ms
+        // 与快照节拍对齐，不再固定 500 ms 无条件排帧。egui 内部动画
+        // 的重绘请求更短时会自然优先（取最早者）。
+        let had_input = ctx.input(|i| {
+            !i.events.is_empty()
+                || i.pointer.any_down()
+                || i.pointer.velocity() != egui::Vec2::ZERO
+        });
+        ctx.request_repaint_after(Duration::from_millis(
+            crate::repaint::repaint_delay_ms(false, had_input),
+        ));
     }
 }
 

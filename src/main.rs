@@ -16,9 +16,11 @@ mod fontdata;
 mod gui;
 mod history;
 mod icon;
+mod meminfo;
 mod names;
 mod notify;
 mod prefs;
+mod repaint;
 mod single_instance;
 mod startup;
 mod totals;
@@ -135,6 +137,10 @@ fn main() -> eframe::Result {
         height: icon::SIZE,
     };
     let native_options = eframe::NativeOptions {
+        // 渲染器锁定 glow：Cargo.toml 已关掉 eframe 的 wgpu feature，
+        // 这里再显式写明，防止将来 feature 变化时被 Renderer::default()
+        // 静默切回 wgpu（两者并存时默认选 wgpu，常驻内存高数十 MB）。
+        renderer: eframe::Renderer::Glow,
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 720.0])
             .with_min_inner_size([720.0, 480.0])

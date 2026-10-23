@@ -1,124 +1,150 @@
-# Throttle
-[![release](https://img.shields.io/github/v/release/FrancescoCoding/Throttle)](https://github.com/FrancescoCoding/Throttle/releases)
-![platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D6)
-![rust](https://img.shields.io/badge/built%20with-Rust-orange)
-![rust](https://img.shields.io/github/downloads/FrancescoCoding/Throttle/total)
+# 流量监控 · Throttle 中文增强版
 
+> 本项目基于开源项目 [Throttle](https://github.com/FrancescoCoding/Throttle)
+> （作者 Francesco Gruosso，MIT 许可证）v0.1.2 修改，在其按进程流量监控
+> 与限速引擎之上做全中文极简改造，新增本地历史记录、"持续高上传"提醒、历史总累计、托盘后台运行与内存占用自报。
+> 上游的监控/归属/限速引擎代码未作改动。
 
-A free, open-source **NetLimiter-style bandwidth monitor and limiter for Windows**,
-written in Rust. It shows live per-process download/upload rates and lets you cap
-or block any process's network traffic, with no license nags and no telemetry.
+Throttle 中文增强版是一个 Windows 桌面小工具：实时显示全机与每个进程的
+上传/下载速度和累计流量，帮你发现"哪个程序在后台持续上传大量数据"。
 
-## What it is
+## 主要功能
 
-Throttle watches every network flow on your machine, attributes it to the
-owning process, and optionally shapes it:
+- **全机实时速率**：顶部显示当前总下载/上传速度与最近 120 秒曲线。
+- **按进程统计**：每个进程的连接数、实时上下行速度、本次运行累计流量，
+  可排序；选中进程可看最近 60 秒速率曲线（原版功能，保留）。
+- **中文友好进程名**（新增）：进程列表主列优先显示中文名（如
+  weixin.exe 显示为"微信"、verge-mihomo.exe 显示为"Clash Verge"），
+  来源依次为内置别名表和程序自带的版本说明；取不到的回退显示
+  exe 英文文件名。详情里同时给出 exe 文件名与完整路径，告警横幅、
+  系统弹窗和历史告警里以"中文名（exe名）"形式显示以便辨认；
+  系统进程与没有中文名的程序仍会显示英文名，属正常现象。
+- **本地历史记录**（新增）：每分钟落盘一条各进程流量增量，关掉重开
+  仍可查；保存在本机 `%APPDATA%\Throttle\history.jsonl`，保留 30 天。
+- **持续高上传提醒**（新增）：单进程上传速度连续超过阈值（默认
+  500 KB/s、持续 30 秒）触发提醒，三条通道同时生效：界面顶部红色
+  横幅、Windows 系统弹窗通知（右下角弹出、通知中心留痕）、记入
+  历史；短暂峰值不触发，同一次异常只提醒一次，回落到阈值 80%
+  以下才重新布防。阈值、持续时间可调；可把信任的程序加入忽略
+  名单（默认名单为空）。系统弹窗需要在开始菜单有一个指向本程序
+  的"流量监控"快捷方式作为通知身份，程序首次运行时会自动创建
+  （详见使用说明）。
+- **开机自启动**（新增）：在"告警设置"窗口里可开关，**默认关闭**。
+  开启后写入当前用户的登录启动项（注册表 `HKCU\...\Run`，值名
+  `Throttle`），登录 Windows 时无参数自动启动；仅对当前用户生效，
+  不需要管理员权限。程序被移动/改名后，设置里会提示启动项已失效，
+  可一键修复或关闭。
+- **历史总累计**（新增）：每个进程一份跨重启的总下载/总上传
+  （主表「历史累计下载/历史累计上传」两列与详情面板），单独存放在
+  `%APPDATA%\Throttle\totals.json`，每分钟按增量累加，不受历史
+  记录 30 天清理影响、永不自动清零；历史记录窗口顶部有全进程的
+  历史总计，并可一键手动清零（二次确认）重新开始。主界面顶部
+  另有本次运行的全进程总下载/总上传/合计。
+- **托盘后台运行**（新增）：关闭窗口默认缩到系统托盘继续监控
+  （"告警设置"里可关，关后 × 恢复直接退出）。托盘图标悬停显示
+  当前总速率；左键点击恢复窗口，右键菜单可打开或彻底退出；
+  第一次缩到托盘时会弹系统通知说明操作。
+- **全中文界面**（新增）：界面文案全量中文化，运行时加载系统微软
+  雅黑字体，不打包字体文件。
+- **内存占用自报**（新增）： "关于"窗口实时显示本进程的工作集与
+  私有提交内存；同时 `throttle.log` 每 60 秒记录一行，便于与任务
+  管理器对照、跨版本比较。渲染后端已由 wgpu 切换为更轻量的 glow
+  （OpenGL），界面功能与显示不变（一致性待真机复核，见"已知限制"）。
+- **零联网**（调整）：已移除上游的自动更新检查；无云端服务、无遥测。
 
-- **Live monitoring:** per-process download and upload rates, totals, and active
-  flow counts, refreshed about once a second.
-- **Per-process limits:** cap a process's download and/or upload speed
-  (for example, hold a game updater to 2 MB/s).
-- **Blocking:** drop all traffic for a process entirely.
-- **Persistent rules:** rules are matched by executable path, so they survive
-  restarts and re-apply automatically when the process launches again.
+原版的按进程限速/阻断规则功能保留（右键进程设置）。
 
-Traffic interception uses [WinDivert](https://reqrypt.org/windivert.html), a
-signed, well-established user-mode packet-diversion driver, so Throttle does not
-need its own kernel driver.
+## 适用系统
 
-https://github.com/user-attachments/assets/632312e7-4096-4957-b2f7-f2277aa96bb3
+- 设计目标：Windows 10 / 11，**x64**。
+- **已验证环境**：Windows 11 x64 真机一台（2026-10-23，管理员运行：
+  启动、WinDivert 驱动加载、实时抓包与进程归属、中文界面渲染均
+  正常）。Windows 10 与其他机器尚未逐一验证。
+- 需要**管理员权限**运行（抓包驱动 WinDivert 的要求，启动时弹 UAC
+  属正常现象）。
+- **未做代码签名**：exe 没有 Authenticode 数字签名，首次运行可能
+  出现 SmartScreen "未知发布者"提示（点"更多信息 → 仍要运行"）；
+  正式签名需要代码签名证书，本版本未签名，介意者可按 BUILD.md
+  自行构建。
 
-## Features
+## 快速使用
 
-- Native GUI (egui/eframe): sortable process table, total-traffic graph, and a
-  per-process history sparkline.
-- Humanized rates and totals (B/s, KB/s, MB/s, GB/s, base 1024).
-- Right-click any process to set a download limit, set an upload limit, block,
-  unblock, or remove its rule.
-- Rate editor uses a number field plus a unit dropdown (B/s, KB/s, MB/s, GB/s).
-- Runs as a single elevated process; engine and GUI communicate over channels.
+1. 下载 Release 的压缩包并解压，保持三个文件在同一目录：
+   `throttle.exe`、`WinDivert.dll`、`WinDivert64.sys`。
+2. 右键 `throttle.exe` → 以管理员身份运行（直接双击会因权限不足
+   弹出错误页，这是预期行为）。
+3. 想让某个程序持续高上传时提醒你：菜单栏"告警设置"里确认阈值
+   （默认 500 KB/s / 30 秒）即可，触发时界面顶部出现红色横幅，
+   同时 Windows 右下角会弹系统通知；事后在"历史记录"里查告警
+   事件和每分钟流量记录。若没收到系统弹窗，先按使用说明检查
+   Windows 的通知设置与专注助手。
+4. 卸载：退出程序后删除解压文件夹即可；如需彻底清理，再删除
+   `%APPDATA%\Throttle` 数据目录（详见使用说明的"卸载"一节）。
+   若曾开启过开机自启动，删文件夹前先在"告警设置"里把开关关掉，
+   以免登录启动项残留。
 
-## Screenshots
+更详细的操作、设置与文件位置见 [使用说明.md](使用说明.md)；
+自行构建见 [BUILD.md](BUILD.md)。
 
-<img width="818" height="452" alt="Throttle demo" src="https://github.com/user-attachments/assets/eeeb9d21-e78f-4832-ae14-7dddc8e905c7" />
+## 权限要求
 
-<img width="818" height="452" alt="Throttle download limit" src="https://github.com/user-attachments/assets/8b2238fb-3dc5-4fba-bf9e-c32c1ff3367e" />
+- **管理员权限**：WinDivert 驱动只能从提权进程打开，程序无法绕过。
+  权限不足时程序会弹出中文提示说明原因。
+- 杀毒软件可能启发式拦截 `WinDivert64.sys` / `WinDivert.dll`（WinDivert
+  的常见误报）。**请勿为运行本软件而关闭杀毒软件**；如需放行，请先
+  核对文件来源（官方 Release 或自行构建），再将这两个文件加入信任名单。
 
-## Download
+## 已知限制
 
-Prebuilt Windows binaries are available on the
-[Releases page](https://github.com/FrancescoCoding/Throttle/releases).
-Grab the latest `Throttle-vX.Y.Z-windows-x64.zip`, extract it anywhere, and run
-`throttle.exe`. The WinDivert driver files are included in the zip, so no extra
-setup is needed. Windows will show a UAC prompt because the app needs
-administrator rights (see below).
+- **真机验证进度（截至 2026-10-23）**：已在一台 Windows 11 x64
+  真机完成首次验证——管理员启动、WinDivert 驱动加载、实时抓包、
+  进程列表/连接数/速率/累计显示、中文渲染均正常（见
+  [测试报告.md](测试报告.md)）。**尚未验证**：持续高上传告警的
+  端到端触发、系统弹窗通知实际弹出、开机自启动的登录行为、托盘
+  后台运行全套行为、历史记录与历史总累计跨重启读回/清零、进程
+  退出清理、长时间运行的资源占用，以及最新一版（渲染器切换
+  glow 后）的内存实际占用与显示一致性。首次使用请注意核对数据
+  是否合理；发现问题欢迎反馈。
+- **已知问题：启动失败页中文显示为方框**：权限不足等原因触发的
+  启动失败页未加载中文字体，其中的中文会显示为方框（英文错误
+  信息可读）；主界面不受影响。已记录待修。
+- **未签名**：exe 无数字签名，SmartScreen 可能拦截，处理方法见
+  "适用系统"一节。
+- **进程归属盲区**：开启本地代理（加速器、抓包代理等）后，经代理
+  转发的流量会记到代理进程名下；环回（loopback）流量不统计；无法
+  归属的流量计入"未归属流量"一行。
+- **进程聚合口径**：同一程序的多个进程按可执行文件路径合并为一行
+  显示，PID 为其中一个进程的编号。
+- **历史粒度**：历史记录为每分钟汇总（告警事件为精确时间）；主界面
+  的"累计"是本次运行累计，重启清零，与跨重启的历史记录是两个口径，
+  不要相加。
+- 交叉编译的 exe 不带管理员清单，首次需手动右键管理员运行；按
+  BUILD.md 在 Windows 本机构建可得到带清单的正式包。
 
-## Building
+## 版本口径
 
-You need a recent stable Rust toolchain (2024 edition) and the WinDivert files
-vendored in this repo under `vendor/WinDivert-2.2.2-A/x64`.
+- **0.1.2**：上游 Throttle 的程序版本号，本项目未改动程序版本
+  字段（`Cargo.toml`、exe 元数据均为 0.1.2）。
+- **v1–v7**：本项目内部开发迭代的序号（v7 = 内存优化第二轮），
+  不是对外发布版本号，不会出现在程序界面或文件名中。
+- **对外发布版本号**：**待发布者确定**（发布说明草稿曾暂用
+  `v0.1.2-zh.1` 作为代号，未定版）；正式发布时以 Release 页面
+  标注为准，并应同步回填本节。
 
-```powershell
-# From the repository root:
-cargo build --release
-```
+## 许可证
 
-The build links against WinDivert using the import library at
-`vendor/WinDivert-2.2.2-A/x64` (wired up via `WINDIVERT_PATH` in
-`.cargo/config.toml`), and embeds a `requireAdministrator` manifest through the
-`embed-manifest` build script.
-
-### Running
-
-WinDivert is loaded dynamically at runtime. Copy its two runtime files next to
-the built executable before running:
-
-```powershell
-copy vendor\WinDivert-2.2.2-A\x64\WinDivert.dll   target\release\
-copy vendor\WinDivert-2.2.2-A\x64\WinDivert64.sys target\release\
-```
-
-Then launch it:
-
-```powershell
-target\release\throttle.exe
-```
-
-## Administrator requirement
-
-Throttle must run as Administrator, because WinDivert can only open its device
-from an elevated process. The embedded manifest requests elevation, so Windows
-shows a UAC prompt on launch. If the backend can't start (not elevated, or the
-WinDivert files are missing), the app opens a small window explaining the error
-instead of exiting silently.
-
-## Antivirus note
-
-WinDivert is a legitimate packet-capture driver, but because it is also used by
-some game "boosters" and, occasionally, by malware, a few antivirus products
-flag it heuristically. The files vendored here come from the official signed
-WinDivert 2.2.2 release. If your AV quarantines `WinDivert64.sys` or
-`WinDivert.dll`, verify them against the official distribution at
-<https://reqrypt.org/windivert.html> and allow-list them if you trust the source.
-
-## VPNs and web-filtering proxies
-
-Some security products (for example NordVPN Threat Protection) intercept
-browser connections and route them through a local proxy on the same machine.
-While such a feature is active, the proxy process is the one talking to the
-internet, so Throttle shows the browser's traffic under the proxy's process
-(such as `nordsec-threatprotection-service`) and a limit set on the browser
-itself has no effect; set it on the proxy process instead. Throttle does not
-capture loopback traffic, so the interception itself keeps working.
-
-## License
-
-- Throttle's own source code is licensed under the MIT License (see `LICENSE`).
-- WinDivert (`WinDivert.dll`, `WinDivert64.sys`, headers/import lib) is a
-  separate project licensed under the **LGPL v3** (with a GPL/proprietary dual
-  option). Throttle links to it dynamically and ships it as a separate,
-  replaceable DLL/driver; it is not statically linked into the binary. See
-  `vendor/WinDivert-2.2.2-A/LICENSE` for the full text and terms.
-
-The MIT code and the LGPL WinDivert component stay independently licensed.
-Replacing the bundled WinDivert files with your own build is supported.
+- 本项目代码：**MIT License**，原作者版权
+  `Copyright (c) 2026 Francesco Gruosso`，修改部分版权见
+  [LICENSE](LICENSE)。
+- 随附的 **WinDivert**（`WinDivert.dll`、`WinDivert64.sys`，版本
+  2.2.2）：双许可 **LGPL v3 / GPL v2** 任选，本项目按 LGPL v3 以
+  独立文件形式分发，许可证全文见仓库
+  [licenses/WinDivert-LICENSE.txt](licenses/WinDivert-LICENSE.txt)
+  （发布包内附同名文件）。
+- 界面框架（egui/epaint）内嵌的字体（Hack、Noto Emoji、Ubuntu
+  Light、emoji-icon-font）各有其许可证（MIT / SIL OFL 1.1 /
+  Ubuntu Font Licence 1.0 / MIT），全文见 `licenses/`
+  目录（发布包内同步附带），逐项核实记录见
+  [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) 第 4 节。
+- 全部第三方依赖的许可证清单见
+  [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)。

@@ -14,6 +14,7 @@ use egui_plot::{Legend, Line, Plot, PlotPoints};
 use crate::backend::rules;
 use crate::backend::synthetic::{is_shapable, is_system};
 use crate::history::{self, HistoryRecord};
+use crate::startup::StartupStatus;
 use crate::types::{AlertSettings, Command, ProcessStats, Rule, Snapshot};
 
 /// How many total-rate samples we keep for the header graph.
@@ -227,6 +228,14 @@ struct LimitModal {
     error: Option<String>,
 }
 
+/// 开机自启动一节里的用户动作（立即生效，不走告警草稿的"保存"流程）。
+#[cfg(windows)]
+enum StartupAction {
+    Enable,
+    Disable,
+    Refresh,
+}
+
 /// 告警设置窗口的编辑状态（打开时从后端快照复制一份，保存才下发）。
 struct AlertDraft {
     threshold_value: String,
@@ -259,6 +268,11 @@ pub struct ThrottleApp {
 
     alert_open: bool,
     alert_draft: Option<AlertDraft>,
+    /// 开机自启动状态：每次打开告警设置窗口时实时读注册表刷新，
+    /// 不用任何缓存值冒充。`None` 表示尚未读取（或非 Windows 平台）。
+    startup_status: Option<StartupStatus>,
+    /// 最近一次开机自启动操作的结果提示（文字 + 是否为错误）。
+    startup_note: Option<(String, bool)>,
     history_open: bool,
     history_rows: Vec<HistoryRecord>,
 }
@@ -284,6 +298,8 @@ impl ThrottleApp {
             shutdown_sent: false,
             alert_open: false,
             alert_draft: None,
+            startup_status: None,
+            startup_note: None,
             history_open: false,
             history_rows: Vec::new(),
         }
@@ -481,7 +497,65 @@ impl ThrottleApp {
         });
     }
 
+    /// 实时读注册表刷新开机自启动状态（每次打开设置窗口时调用）。
+    #[cfg(windows)]
+    fn refresh_startup_status(&mut self) {
+        let store = crate::startup::RegistryStartupStore;
+        self.startup_status = Some(match std::env::current_exe() {
+            Ok(exe) => crate::startup::current_status(&store, &exe),
+            Err(e) => StartupStatus::ReadError(format!("无法确定当前程序路径：{e}")),
+        });
+    }
+
+    #[cfg(not(windows))]
+    fn refresh_startup_status(&mut self) {}
+
+    /// 执行开机自启动的启用/关闭/重读，结果（成功或失败）都写回状态与提示，
+    /// 失败后按注册表实际值刷新显示，绝不假报成功。
+    #[cfg(windows)]
+    fn apply_startup_action(&mut self, action: StartupAction) {
+        match action {
+            StartupAction::Refresh => {
+                self.refresh_startup_status();
+                self.startup_note = None;
+            }
+            StartupAction::Enable | StartupAction::Disable => {
+                let enable = matches!(action, StartupAction::Enable);
+                let store = crate::startup::RegistryStartupStore;
+                let result = if enable {
+                    match std::env::current_exe() {
+                        Ok(exe) => crate::startup::enable(&store, &exe),
+                        Err(e) => Err(format!("无法确定当前程序路径：{e}")),
+                    }
+                } else {
+                    crate::startup::disable(&store)
+                };
+                match result {
+                    Ok(status) => {
+                        self.startup_status = Some(status);
+                        self.startup_note = Some((
+                            if enable {
+                                "已开启：下次登录 Windows 时会自动启动。".to_string()
+                            } else {
+                                "已关闭：开机启动项已删除。".to_string()
+                            },
+                            false,
+                        ));
+                    }
+                    Err(msg) => {
+                        self.startup_note = Some((msg, true));
+                        // 显示注册表里的真实状态，避免界面与系统不一致。
+                        self.refresh_startup_status();
+                    }
+                }
+            }
+        }
+    }
+
     fn open_alert_settings(&mut self) {
+        // 开机自启动状态每次打开窗口都实时读注册表，不用缓存。
+        self.refresh_startup_status();
+        self.startup_note = None;
         let s = &self.last_snapshot.alert_settings;
         let (value, unit) = if s.up_threshold_bps == 0 {
             (0.0, RateUnit::KBps)
@@ -512,6 +586,14 @@ impl ThrottleApp {
         let mut open = true;
         let mut save = false;
         let mut cancel = false;
+        // 开机自启动一节用的是打开窗口时实时读到的状态副本；
+        // 动作先记下来，窗口画完再统一执行并回读刷新。
+        #[cfg(windows)]
+        let startup_status = self.startup_status.clone();
+        #[cfg(windows)]
+        let startup_note = self.startup_note.clone();
+        #[cfg(windows)]
+        let mut startup_action: Option<StartupAction> = None;
         egui::Window::new("异常上传提醒设置")
             .collapsible(false)
             .resizable(false)
@@ -567,6 +649,73 @@ impl ThrottleApp {
                         .desired_width(f32::INFINITY)
                         .hint_text("例如：trusted.exe"),
                 );
+                #[cfg(windows)]
+                {
+                    ui.separator();
+                    ui.label(egui::RichText::new("开机启动").strong());
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "写入位置：{}，值名 Throttle；仅对当前登录用户生效，\
+                             不需要管理员权限。此开关立即生效，不用点“保存”。",
+                            crate::startup::RUN_KEY_DISPLAY
+                        ))
+                        .weak()
+                        .small(),
+                    );
+                    match &startup_status {
+                        Some(StartupStatus::ReadError(msg)) => {
+                            ui.colored_label(
+                                COLOR_BLOCK,
+                                format!("当前状态：读取失败：{msg}"),
+                            );
+                            if ui.button("重试读取").clicked() {
+                                startup_action = Some(StartupAction::Refresh);
+                            }
+                        }
+                        Some(status) => {
+                            let mut checked = matches!(status, StartupStatus::Enabled);
+                            if ui
+                                .checkbox(&mut checked, "登录 Windows 时自动启动 Throttle")
+                                .changed()
+                            {
+                                startup_action = Some(if checked {
+                                    StartupAction::Enable
+                                } else {
+                                    StartupAction::Disable
+                                });
+                            }
+                            ui.label(format!("当前状态：{}", status.describe()));
+                            if let StartupStatus::Stale { stored_command } = status {
+                                ui.colored_label(
+                                    COLOR_BLOCK,
+                                    format!(
+                                        "失效原因：启动项指向「{stored_command}」，\
+                                         与当前程序位置不一致（程序可能被移动或改名），\
+                                         登录时将无法自动启动。"
+                                    ),
+                                );
+                                ui.horizontal(|ui| {
+                                    if ui.button("修复（按当前路径重写）").clicked() {
+                                        startup_action = Some(StartupAction::Enable);
+                                    }
+                                    if ui.button("关闭（删除失效的启动项）").clicked() {
+                                        startup_action = Some(StartupAction::Disable);
+                                    }
+                                });
+                            }
+                        }
+                        None => {
+                            ui.label("当前状态：尚未读取");
+                        }
+                    }
+                    if let Some((note, is_error)) = &startup_note {
+                        if *is_error {
+                            ui.colored_label(COLOR_BLOCK, note);
+                        } else {
+                            ui.label(note);
+                        }
+                    }
+                }
                 if let Some(err) = &draft.error {
                     ui.colored_label(COLOR_BLOCK, err);
                 }
@@ -580,6 +729,11 @@ impl ThrottleApp {
                     }
                 });
             });
+
+        #[cfg(windows)]
+        if let Some(action) = startup_action {
+            self.apply_startup_action(action);
+        }
 
         if cancel || !open {
             self.alert_open = false;

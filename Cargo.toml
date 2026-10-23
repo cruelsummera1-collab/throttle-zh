@@ -23,3 +23,6 @@ windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_NetworkMa
 [build-dependencies]
 embed-manifest = "1"
 winresource = "0.1.31"
+
+[target."cfg(windows)".dependencies]
+winreg = "0.56.0"

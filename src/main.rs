@@ -16,6 +16,7 @@ mod gui;
 mod history;
 mod icon;
 mod single_instance;
+mod startup;
 mod types;
 
 use crossbeam_channel::unbounded;

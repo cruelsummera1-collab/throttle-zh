@@ -20,6 +20,7 @@ mod meminfo;
 mod names;
 mod notify;
 mod prefs;
+mod relaunch;
 mod repaint;
 mod single_instance;
 mod startup;
@@ -50,7 +51,16 @@ fn main() -> eframe::Result {
     // every packet and undermine the first one's limits. This runs before the
     // log file is opened, because opening it truncates the running instance's
     // log. The lock is held until the process exits.
-    let _instance_lock = match single_instance::acquire() {
+    //
+    // 失败页「以管理员身份重新启动」拉起的实例带 --elevated-relaunch：
+    // 旧实例正在退出让位，抢锁要等它把互斥量放出来，故走等待版；
+    // 普通启动（含开机自启、双击）不带参数，行为与从前一致。
+    let elevated_relaunch = relaunch::has_relaunch_arg(std::env::args());
+    let _instance_lock = match if elevated_relaunch {
+        single_instance::acquire_wait(std::time::Duration::from_secs(15))
+    } else {
+        single_instance::acquire()
+    } {
         Some(lock) => lock,
         None => return Ok(()),
     };
@@ -171,14 +181,38 @@ fn main() -> eframe::Result {
         Err(err) => {
             tracing::error!("backend failed to start: {err:#}");
             let message = format!("{err:#}");
+            let kind = classify_start_error(&err);
             // Show the error in a minimal window instead of exiting silently.
             eframe::run_native(
                 "流量监控 - 启动失败",
                 native_options,
-                Box::new(move |_cc| Ok(Box::new(gui::ErrorApp::new(message.clone())))),
+                Box::new(move |cc| Ok(Box::new(gui::ErrorApp::new(cc, kind, message.clone())))),
             )
         }
     }
+}
+
+/// 把后端启动失败分类为失败页的决策输入：在 anyhow 错误链里找
+/// WinDivert 的打开错误——拒绝访问（5）是没管理员权限，驱动文件
+/// 找不到（2）是文件缺失，其余归为其他。分类只决定失败页的正文与
+/// 是否给提权按钮（决策表在 relaunch::actions_for，有单元测试）。
+fn classify_start_error(err: &anyhow::Error) -> relaunch::FailureKind {
+    use windivert::error::{WinDivertError, WinDivertOpenError};
+    for cause in err.chain() {
+        let Some(werr) = cause.downcast_ref::<WinDivertError>() else {
+            continue;
+        };
+        return match werr {
+            WinDivertError::Open(WinDivertOpenError::AccessDenied) => {
+                relaunch::FailureKind::NotElevated
+            }
+            WinDivertError::Open(WinDivertOpenError::MissingSYS) => {
+                relaunch::FailureKind::MissingDriverFiles
+            }
+            _ => relaunch::FailureKind::Other,
+        };
+    }
+    relaunch::FailureKind::Other
 }
 
 fn setup_logging() {

@@ -1656,13 +1656,11 @@ impl eframe::App for ThrottleApp {
 
         // 托盘悬停提示跟随最新总速率刷新（快照约每秒一帧）。
         #[cfg(windows)]
-        if had_snapshot {
-            if let Some(tray) = &self.tray {
-                tray.set_tooltip(&crate::tray::tooltip_text(
-                    self.last_snapshot.total_down_rate,
-                    self.last_snapshot.total_up_rate,
-                ));
-            }
+        if had_snapshot && let Some(tray) = &self.tray {
+            tray.set_tooltip(&crate::tray::tooltip_text(
+                self.last_snapshot.total_down_rate,
+                self.last_snapshot.total_up_rate,
+            ));
         }
 
         // 托盘动作轮询：左键/双击/菜单「打开」恢复窗口，
@@ -1780,27 +1778,40 @@ fn open_path(path: &std::path::Path) {
 
 pub struct ErrorApp {
     message: String,
+    kind: crate::relaunch::FailureKind,
+    /// 提权尝试被取消/失败后的提示（成功拉起会直接关窗，不留提示）。
+    note: Option<String>,
 }
 
 impl ErrorApp {
-    pub fn new(message: String) -> Self {
-        Self { message }
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        kind: crate::relaunch::FailureKind,
+        message: String,
+    ) -> Self {
+        // 与 ThrottleApp::new 同规矩：字体在 App 构造时装好，赶在
+        // 第一帧绘制之前。失败页以前漏了这一步，中文全是方框；
+        // 两个 App 的构造函数都是各自窗口的唯一入口，字体在此
+        // 安装可保证任何界面分支都不会再漏。
+        install_chinese_fonts(&cc.egui_ctx);
+        Self {
+            message,
+            kind,
+            note: None,
+        }
     }
 }
 
 impl eframe::App for ErrorApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let actions = crate::relaunch::actions_for(self.kind);
         egui::CentralPanel::default().show(ui, |ui| {
             ui.add_space(16.0);
             ui.vertical_centered(|ui| {
                 ui.heading("流量监控无法启动");
             });
             ui.add_space(12.0);
-            ui.label(
-                "后端初始化失败。常见原因：程序没有以管理员身份运行，\
-                 或者 WinDivert 驱动文件（WinDivert.dll / WinDivert64.sys）\
-                 不在程序所在的同一目录下。请确认后重新以管理员身份运行。",
-            );
+            ui.label(actions.body_text);
             ui.add_space(8.0);
             ui.separator();
             ui.add_space(8.0);
@@ -1814,9 +1825,32 @@ impl eframe::App for ErrorApp {
             });
             ui.add_space(12.0);
             ui.separator();
-            if ui.button("关闭").clicked() {
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            if let Some(note) = &self.note {
+                ui.label(egui::RichText::new(note).color(COLOR_BLOCK));
+                ui.add_space(8.0);
             }
+            ui.horizontal(|ui| {
+                if actions.show_elevate_button && ui.button("以管理员身份重新启动").clicked()
+                {
+                    match crate::relaunch::relaunch_elevated() {
+                        crate::relaunch::ElevateOutcome::Launched => {
+                            // 新实例已拉起（它会等待抢锁）：本实例立即
+                            // 退出，进程退出即释放单实例互斥量。
+                            tracing::info!("已拉起管理员实例，本实例退出让位");
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        outcome => {
+                            self.note = crate::relaunch::note_for_outcome(outcome);
+                            if let Some(note) = &self.note {
+                                tracing::warn!("提权重启未成功：{note}");
+                            }
+                        }
+                    }
+                }
+                if ui.button("关闭").clicked() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
         });
     }
 }

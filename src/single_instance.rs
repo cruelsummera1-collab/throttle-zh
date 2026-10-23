@@ -7,7 +7,7 @@
 //! Because Throttle always runs elevated, the mutex lives in the `Global\`
 //! namespace so instances in different sessions still see each other.
 
-use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND};
+use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowW, IsIconic, IsWindowVisible, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow,
@@ -33,14 +33,61 @@ pub struct InstanceLock {
 /// if it can be found, has been restored and brought to the foreground so the
 /// user's double-click still does something visible.
 pub fn acquire() -> Option<InstanceLock> {
+    match try_acquire() {
+        AcquireAttempt::Acquired(lock) => Some(lock),
+        AcquireAttempt::AlreadyRunning => {
+            focus_existing_window();
+            None
+        }
+        AcquireAttempt::Failed => None,
+    }
+}
+
+/// 与 [`acquire`] 相同，但在锁被占用时先等待一段时间再放弃。
+///
+/// 只供失败页「以管理员身份重新启动」拉起的新实例使用：旧实例在拉起
+/// 成功后立即退出、进程退出即释放互斥量，但新进程的启动与旧进程的
+/// 退出存在竞态，新实例抢锁时旧锁可能还没释放。普通双击启动不走
+/// 这里，行为与从前一致（立即唤起已有窗口）。
+pub fn acquire_wait(timeout: std::time::Duration) -> Option<InstanceLock> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match try_acquire() {
+            AcquireAttempt::Acquired(lock) => return Some(lock),
+            AcquireAttempt::Failed => return None,
+            AcquireAttempt::AlreadyRunning => {
+                if std::time::Instant::now() >= deadline {
+                    focus_existing_window();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+    }
+}
+
+/// 一次抢锁尝试的结果。
+enum AcquireAttempt {
+    Acquired(InstanceLock),
+    /// 锁已被另一实例持有（本次尝试的句柄已关闭）。
+    AlreadyRunning,
+    /// CreateMutexW 本身失败。
+    Failed,
+}
+
+fn try_acquire() -> AcquireAttempt {
     // SAFETY: plain Win32 calls with valid, null-terminated static strings.
     unsafe {
-        let handle = CreateMutexW(None, false, w!("Global\\ThrottleSingleInstance")).ok()?;
+        let handle = match CreateMutexW(None, false, w!("Global\\ThrottleSingleInstance")) {
+            Ok(h) => h,
+            Err(_) => return AcquireAttempt::Failed,
+        };
         if GetLastError() == ERROR_ALREADY_EXISTS {
-            focus_existing_window();
-            return None;
+            // 没抢到：关掉本次句柄，锁仍由对方持有。
+            let _ = CloseHandle(handle);
+            return AcquireAttempt::AlreadyRunning;
         }
-        Some(InstanceLock { handle })
+        AcquireAttempt::Acquired(InstanceLock { handle })
     }
 }
 

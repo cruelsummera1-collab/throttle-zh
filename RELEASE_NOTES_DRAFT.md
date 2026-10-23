@@ -79,6 +79,6 @@ v0.1.2（作者 Francesco Gruosso，MIT）的中文增强版。上游的按进�
 ## 许可证
 
 MIT（上游版权与本项目修改部分版权见仓库 LICENSE；修改部分
-署名在正式发布前由发布者填写）。随附 WinDivert 2.2.2 为
+署名为发布者 GitHub 用户名 cruelsummera1-collab）。随附 WinDivert 2.2.2 为
 LGPL v3 / GPL v2 双许可，本项目按 LGPL v3 以独立文件分发；
 第三方依赖清单见 THIRD_PARTY_LICENSES.md。

@@ -216,10 +216,7 @@ fn extract_string(line: &str, key: &str) -> Option<String> {
                 Some((_, '/')) => out.push('/'),
                 Some((_, 'u')) => {
                     let hex: String = chars.by_ref().take(4).map(|(_, c)| c).collect();
-                    if let Some(n) = u32::from_str_radix(&hex, 16)
-                        .ok()
-                        .and_then(char::from_u32)
-                    {
+                    if let Some(n) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
                         out.push(n);
                     }
                 }

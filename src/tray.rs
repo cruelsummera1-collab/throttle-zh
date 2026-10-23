@@ -126,10 +126,7 @@ mod tests {
             icon_event_action(IconEventKind::LeftDoubleClick),
             TrayAction::ShowWindow
         );
-        assert_eq!(
-            icon_event_action(IconEventKind::Other),
-            TrayAction::None
-        );
+        assert_eq!(icon_event_action(IconEventKind::Other), TrayAction::None);
     }
 
     #[test]

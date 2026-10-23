@@ -34,9 +34,7 @@ pub fn summary_line(sample: &MemorySample) -> String {
 /// 采集本进程当前内存占用；失败（或非 Windows 平台）返回 None。
 #[cfg(windows)]
 pub fn sample() -> Option<MemorySample> {
-    use windows::Win32::System::ProcessStatus::{
-        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
-    };
+    use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
     use windows::Win32::System::Threading::GetCurrentProcess;
 
     let mut counters = PROCESS_MEMORY_COUNTERS_EX::default();

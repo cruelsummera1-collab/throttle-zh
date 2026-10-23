@@ -101,7 +101,11 @@ pub fn choose_display_name(exe_name: &str, meta: Option<&RawMetadata>) -> String
         return friendly.to_string();
     }
     if let Some(m) = meta {
-        if let Some(fd) = m.file_description.as_deref().filter(|s| is_usable_metadata(s)) {
+        if let Some(fd) = m
+            .file_description
+            .as_deref()
+            .filter(|s| is_usable_metadata(s))
+        {
             return fd.trim().to_string();
         }
         if let Some(pn) = m.product_name.as_deref().filter(|s| is_usable_metadata(s)) {
@@ -230,10 +234,10 @@ pub fn process_label(exe_path: &str, exe_name: &str) -> String {
 mod win {
     use super::RawMetadata;
     use std::ffi::c_void;
-    use windows::core::PCWSTR;
     use windows::Win32::Storage::FileSystem::{
         GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
     };
+    use windows::core::PCWSTR;
 
     /// 读版本信息；全路径失败只记一条日志并回退（同一路径只解析一次，
     /// 失败结果由上层缓存，故每路径至多记一条）。
@@ -475,10 +479,7 @@ mod tests {
         let path = "c:\\apps\\tool.exe";
         assert_eq!(resolver.display_name(path, "tool.exe"), "测试应用");
         assert_eq!(resolver.display_name(path, "tool.exe"), "测试应用");
-        assert_eq!(
-            resolver.label(path, "tool.exe"),
-            "测试应用（tool.exe）"
-        );
+        assert_eq!(resolver.label(path, "tool.exe"), "测试应用（tool.exe）");
         assert_eq!(resolver.provider.calls(), 1, "同一路径只应解析一次");
 
         // 失败（None）同样缓存，不反复读。

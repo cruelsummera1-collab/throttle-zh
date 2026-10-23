@@ -56,9 +56,7 @@ impl StartupStatus {
         match self {
             StartupStatus::Disabled => "未启用".to_string(),
             StartupStatus::Enabled => "已启用（登录 Windows 时自动启动）".to_string(),
-            StartupStatus::Stale { .. } => {
-                "已失效（启动项指向的程序已被移动或改名）".to_string()
-            }
+            StartupStatus::Stale { .. } => "已失效（启动项指向的程序已被移动或改名）".to_string(),
             StartupStatus::ReadError(e) => format!("读取失败：{e}"),
         }
     }
@@ -345,8 +343,7 @@ mod tests {
     #[test]
     fn enabled_despite_case_and_quote_differences() {
         let store = FakeStore::default();
-        *store.value.borrow_mut() =
-            Some(r"c:\program files\throttle\throttle.exe".to_string());
+        *store.value.borrow_mut() = Some(r"c:\program files\throttle\throttle.exe".to_string());
         let cur = exe(r"C:\Program Files\Throttle\throttle.exe");
         assert_eq!(current_status(&store, &cur), StartupStatus::Enabled);
     }
@@ -357,7 +354,10 @@ mod tests {
         store.fail_write.set(true);
         let path = exe(r"C:\Tools\Throttle\throttle.exe");
         let err = enable(&store, &path).expect_err("写入失败必须报错");
-        assert!(err.contains("写入开机启动项失败"), "错误应为中文说明：{err}");
+        assert!(
+            err.contains("写入开机启动项失败"),
+            "错误应为中文说明：{err}"
+        );
         // 状态不能被假报为成功：注册表仍为空。
         assert_eq!(current_status(&store, &path), StartupStatus::Disabled);
     }
@@ -389,7 +389,10 @@ mod tests {
         enable(&store, &path).unwrap();
         store.fail_delete.set(true);
         let err = disable(&store).expect_err("删除失败必须报错");
-        assert!(err.contains("删除开机启动项失败"), "错误应为中文说明：{err}");
+        assert!(
+            err.contains("删除开机启动项失败"),
+            "错误应为中文说明：{err}"
+        );
         // 启动项还在，状态仍为已启用。
         assert_eq!(current_status(&store, &path), StartupStatus::Enabled);
     }

@@ -201,11 +201,7 @@ fn install_chinese_fonts(ctx: &egui::Context) {
         let bytes = if bytes.starts_with(b"ttcf") {
             match crate::fontdata::first_face(&bytes) {
                 Some(face) => {
-                    tracing::info!(
-                        "已提取 TTC 首字重：{} → {} 字节",
-                        bytes.len(),
-                        face.len()
-                    );
+                    tracing::info!("已提取 TTC 首字重：{} → {} 字节", bytes.len(), face.len());
                     face
                 }
                 None => bytes,
@@ -347,9 +343,8 @@ impl ThrottleApp {
         install_chinese_fonts(&cc.egui_ctx);
         // 界面偏好：文件不存在/损坏都用默认值（缩到托盘默认开启），
         // 只记日志，绝不影响启动。
-        let (prefs_store, prefs_status) = crate::prefs::PrefsStore::load(
-            crate::prefs::prefs_path(&rules::config_dir()),
-        );
+        let (prefs_store, prefs_status) =
+            crate::prefs::PrefsStore::load(crate::prefs::prefs_path(&rules::config_dir()));
         match prefs_status {
             crate::prefs::LoadStatus::Loaded => {}
             crate::prefs::LoadStatus::Fresh => {
@@ -810,7 +805,9 @@ impl ThrottleApp {
                         .small(),
                 );
                 ui.separator();
-                ui.label("忽略名单（每行一个进程名或完整路径，不区分大小写；留空表示不忽略任何程序）：");
+                ui.label(
+                    "忽略名单（每行一个进程名或完整路径，不区分大小写；留空表示不忽略任何程序）：",
+                );
                 ui.add(
                     egui::TextEdit::multiline(&mut draft.ignore_text)
                         .desired_rows(4)
@@ -832,10 +829,7 @@ impl ThrottleApp {
                     );
                     match &startup_status {
                         Some(StartupStatus::ReadError(msg)) => {
-                            ui.colored_label(
-                                COLOR_BLOCK,
-                                format!("当前状态：读取失败：{msg}"),
-                            );
+                            ui.colored_label(COLOR_BLOCK, format!("当前状态：读取失败：{msg}"));
                             if ui.button("重试读取").clicked() {
                                 startup_action = Some(StartupAction::Refresh);
                             }
@@ -1000,8 +994,7 @@ impl ThrottleApp {
     }
 
     fn open_history(&mut self) {
-        self.history_rows =
-            history::read_recent(&history::history_path(&rules::config_dir()), 500);
+        self.history_rows = history::read_recent(&history::history_path(&rules::config_dir()), 500);
         self.history_reset_confirm = false;
         self.history_open = true;
     }
@@ -1226,20 +1219,11 @@ impl ThrottleApp {
                     ui.separator();
                     ui.label(format!("{} 个进程", snap.processes.len()));
                     ui.separator();
-                    ui.label(format!(
-                        "总下载 {}",
-                        humanize_bytes(snap.grand_down_total)
-                    ));
-                    ui.label(format!(
-                        "总上传 {}",
-                        humanize_bytes(snap.grand_up_total)
-                    ));
+                    ui.label(format!("总下载 {}", humanize_bytes(snap.grand_down_total)));
+                    ui.label(format!("总上传 {}", humanize_bytes(snap.grand_up_total)));
                     ui.label(format!(
                         "合计 {}",
-                        humanize_bytes(
-                            snap.grand_down_total
-                                .saturating_add(snap.grand_up_total)
-                        )
+                        humanize_bytes(snap.grand_down_total.saturating_add(snap.grand_up_total))
                     ));
                 });
 
@@ -1381,9 +1365,7 @@ impl ThrottleApp {
                 SortColumn::Up => a.up_rate.cmp(&b.up_rate),
                 SortColumn::DownTotal => a.down_total.cmp(&b.down_total),
                 SortColumn::UpTotal => a.up_total.cmp(&b.up_total),
-                SortColumn::HistoryDownTotal => {
-                    a.history_down_total.cmp(&b.history_down_total)
-                }
+                SortColumn::HistoryDownTotal => a.history_down_total.cmp(&b.history_down_total),
                 SortColumn::HistoryUpTotal => a.history_up_total.cmp(&b.history_up_total),
             };
             if sort_desc { ord.reverse() } else { ord }
@@ -1489,11 +1471,9 @@ impl ThrottleApp {
             // System is shapable, but covers more than people expect.
             if is_system(key) {
                 ui.label(
-                    egui::RichText::new(
-                        "系统流量：包括 VPN 隧道、网络共享和 Windows 更新",
-                    )
-                    .weak()
-                    .small(),
+                    egui::RichText::new("系统流量：包括 VPN 隧道、网络共享和 Windows 更新")
+                        .weak()
+                        .small(),
                 );
                 ui.separator();
             }
@@ -1550,11 +1530,7 @@ impl ThrottleApp {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.label(format!("进程：{}", modal.name));
-                ui.label(
-                    egui::RichText::new("留空表示不限速。")
-                        .weak()
-                        .small(),
-                );
+                ui.label(egui::RichText::new("留空表示不限速。").weak().small());
                 ui.horizontal(|ui| {
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut modal.value)
@@ -1672,10 +1648,7 @@ impl eframe::App for ThrottleApp {
                         .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(60));
                     if log_due {
                         self.mem_logged_at = Some(now);
-                        tracing::info!(
-                            "内存占用（自报）：{}",
-                            crate::meminfo::summary_line(&s)
-                        );
+                        tracing::info!("内存占用（自报）：{}", crate::meminfo::summary_line(&s));
                     }
                 }
             }
@@ -1740,9 +1713,9 @@ impl eframe::App for ThrottleApp {
         // 低频帧排干快照、轮询托盘动作与上面的唤起对齐。后端抓包、
         // 告警、弹窗与累计都在后端线程里进行，不受影响。
         if self.window_hidden {
-            ctx.request_repaint_after(Duration::from_millis(
-                crate::repaint::repaint_delay_ms(true, false),
-            ));
+            ctx.request_repaint_after(Duration::from_millis(crate::repaint::repaint_delay_ms(
+                true, false,
+            )));
             return;
         }
 
@@ -1769,13 +1742,11 @@ impl eframe::App for ThrottleApp {
         // 与快照节拍对齐，不再固定 500 ms 无条件排帧。egui 内部动画
         // 的重绘请求更短时会自然优先（取最早者）。
         let had_input = ctx.input(|i| {
-            !i.events.is_empty()
-                || i.pointer.any_down()
-                || i.pointer.velocity() != egui::Vec2::ZERO
+            !i.events.is_empty() || i.pointer.any_down() || i.pointer.velocity() != egui::Vec2::ZERO
         });
-        ctx.request_repaint_after(Duration::from_millis(
-            crate::repaint::repaint_delay_ms(false, had_input),
-        ));
+        ctx.request_repaint_after(Duration::from_millis(crate::repaint::repaint_delay_ms(
+            false, had_input,
+        )));
     }
 }
 

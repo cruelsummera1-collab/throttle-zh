@@ -7,9 +7,7 @@
 //! 图标就会消失。
 
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
-use tray_icon::{
-    Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
-};
+use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use crate::tray::{
     IconEventKind, MENU_OPEN_ID, MENU_QUIT_ID, TrayAction, icon_event_action, menu_action,
@@ -25,12 +23,8 @@ impl TrayHandle {
     /// 失败返回错误字符串，由调用方记日志并降级为无托盘运行
     /// （此时关闭窗口恢复真退出，见 gui 的安全兜底）。
     pub fn new() -> Result<Self, String> {
-        let icon = Icon::from_rgba(
-            crate::icon::rgba(),
-            crate::icon::SIZE,
-            crate::icon::SIZE,
-        )
-        .map_err(|e| format!("托盘图标创建失败：{e}"))?;
+        let icon = Icon::from_rgba(crate::icon::rgba(), crate::icon::SIZE, crate::icon::SIZE)
+            .map_err(|e| format!("托盘图标创建失败：{e}"))?;
         let open_item = MenuItem::with_id(MENU_OPEN_ID, "打开流量监控", true, None);
         let quit_item = MenuItem::with_id(MENU_QUIT_ID, "退出程序", true, None);
         let menu = Menu::with_items(&[&open_item, &quit_item])

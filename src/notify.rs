@@ -161,7 +161,6 @@ pub fn init() {
 mod win {
     use super::{APP_USER_MODEL_ID, SHORTCUT_DISPLAY_NAME};
     use std::path::{Path, PathBuf};
-    use windows::core::{Interface, PCWSTR, PWSTR};
     use windows::Win32::Foundation::{PROPERTYKEY, RPC_E_CHANGED_MODE};
     use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
     use windows::Win32::System::Com::{
@@ -173,6 +172,7 @@ mod win {
     use windows::Win32::UI::Shell::{
         IShellLinkW, SetCurrentProcessExplicitAppUserModelID, ShellLink,
     };
+    use windows::core::{Interface, PCWSTR, PWSTR};
 
     /// UTF-16 NUL 结尾缓冲（供 PCWSTR 参数使用）。
     fn wide(s: &str) -> Vec<u16> {
@@ -208,9 +208,7 @@ mod win {
     /// 线程（涉及 COM 与文件读写），不拖慢启动。
     pub fn init() {
         let aumid = wide(APP_USER_MODEL_ID);
-        if let Err(e) =
-            unsafe { SetCurrentProcessExplicitAppUserModelID(PCWSTR(aumid.as_ptr())) }
-        {
+        if let Err(e) = unsafe { SetCurrentProcessExplicitAppUserModelID(PCWSTR(aumid.as_ptr())) } {
             tracing::warn!("设置进程 AppUserModelID 失败（系统通知可能不显示）：{e}");
         }
         let spawned = std::thread::Builder::new()
@@ -238,8 +236,8 @@ mod win {
 
     /// 开始菜单快捷方式路径：%APPDATA%\Microsoft\Windows\Start Menu\Programs\流量监控.lnk
     fn shortcut_path() -> Result<PathBuf, String> {
-        let appdata = std::env::var_os("APPDATA")
-            .ok_or_else(|| "无法读取 APPDATA 环境变量".to_string())?;
+        let appdata =
+            std::env::var_os("APPDATA").ok_or_else(|| "无法读取 APPDATA 环境变量".to_string())?;
         Ok(PathBuf::from(appdata)
             .join("Microsoft")
             .join("Windows")
@@ -259,8 +257,7 @@ mod win {
     /// 快捷方式不存在、或指向的不是当前 exe、或 AUMID 不对时（重）建之；
     /// 已正确指向当前程序则什么都不做（幂等，移动程序后下次启动自动修复）。
     fn ensure_start_menu_shortcut() -> Result<(), String> {
-        let exe =
-            std::env::current_exe().map_err(|e| format!("无法确定当前程序路径：{e}"))?;
+        let exe = std::env::current_exe().map_err(|e| format!("无法确定当前程序路径：{e}"))?;
         let lnk = shortcut_path()?;
         let _co = CoInit::new(COINIT_APARTMENTTHREADED)?;
         if lnk.exists() && shortcut_is_current(&lnk, &exe) {
@@ -303,12 +300,9 @@ mod win {
             };
             let ok = pv.Anonymous.Anonymous.vt == VT_LPWSTR && {
                 let p = pv.Anonymous.Anonymous.Anonymous.pwszVal;
-                !p.is_null()
-                    && read_pwstr(p).is_some_and(|s| s == APP_USER_MODEL_ID)
+                !p.is_null() && read_pwstr(p).is_some_and(|s| s == APP_USER_MODEL_ID)
             };
-            let _ = windows::Win32::System::Com::StructuredStorage::PropVariantClear(
-                &mut pv,
-            );
+            let _ = windows::Win32::System::Com::StructuredStorage::PropVariantClear(&mut pv);
             ok
         }
     }
@@ -331,9 +325,8 @@ mod win {
     /// 并写入 AUMID 属性后落盘。
     fn create_shortcut(lnk: &Path, exe: &Path) -> Result<(), String> {
         unsafe {
-            let link: IShellLinkW =
-                CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)
-                    .map_err(|e| format!("创建 ShellLink 失败：{e}"))?;
+            let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)
+                .map_err(|e| format!("创建 ShellLink 失败：{e}"))?;
             let exe_s = exe.to_string_lossy().to_string();
             let exe_w = wide(&exe_s);
             link.SetPath(PCWSTR(exe_w.as_ptr()))
@@ -415,7 +408,10 @@ mod tests {
 
     #[test]
     fn xml_escape_covers_special_chars() {
-        assert_eq!(xml_escape("a&b<c>d\"e'f"), "a&amp;b&lt;c&gt;d&quot;e&apos;f");
+        assert_eq!(
+            xml_escape("a&b<c>d\"e'f"),
+            "a&amp;b&lt;c&gt;d&quot;e&apos;f"
+        );
         assert_eq!(xml_escape("普通文本"), "普通文本");
     }
 

@@ -83,7 +83,9 @@ pub fn first_face(data: &[u8]) -> Option<Vec<u8>> {
         let offset = be_u32(data, ro + 8)? as usize;
         let length = be_u32(data, ro + 12)? as usize;
         // 表数据必须完整落在源文件内（checked 防溢出与越界）。
-        offset.checked_add(length).filter(|&end| end <= data.len())?;
+        offset
+            .checked_add(length)
+            .filter(|&end| end <= data.len())?;
         recs.push(TableRec {
             tag,
             checksum,

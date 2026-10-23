@@ -99,9 +99,7 @@ fn is_ignored(ignore: &[String], s: &ProcSample) -> bool {
     let name = s.name.to_lowercase();
     let path = s.exe_path.to_lowercase();
     let key = s.key.to_lowercase();
-    ignore
-        .iter()
-        .any(|e| e == &name || e == &path || e == &key)
+    ignore.iter().any(|e| e == &name || e == &path || e == &key)
 }
 
 impl AlertEngine {
@@ -170,9 +168,7 @@ impl AlertEngine {
                     st.above_since = Some(tick);
                 }
                 let since = st.above_since.unwrap_or(tick);
-                if st.fired_tick.is_none()
-                    && tick.saturating_sub(since) >= self.duration_secs
-                {
+                if st.fired_tick.is_none() && tick.saturating_sub(since) >= self.duration_secs {
                     st.fired_tick = Some(tick);
                     st.threshold_at_fire = self.threshold_bps;
                     events.push(AlertEvent {

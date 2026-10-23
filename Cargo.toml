@@ -4,6 +4,7 @@ version = "0.1.2"
 edition = "2024"
 description = "按进程统计的网络流量监控工具（中文极简版，基于 Throttle 改造）"
 license = "MIT"
+repository = "https://github.com/cruelsummera1-collab/throttle-zh"
 
 [dependencies]
 anyhow = "1.0.103"

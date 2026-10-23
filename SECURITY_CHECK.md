@@ -52,9 +52,11 @@ find . -name "*.env" -o -name "*.pem" -o -name "*.key" -o -name "*credential*"
 
 ## 其他说明
 
-- `Cargo.toml` 原 `repository` 字段指向上游仓库，本轮发布准备
-  已**移除**该字段（避免本仓库元数据指向他仓）；上游出处改由
-  README 与 LICENSE 中的标注保留，不影响溯源。
+- `Cargo.toml` 原 `repository` 字段指向上游仓库；发布准备中
+  一度移除，2026-10-23 发布仓库确定后已改为发布者自己的仓库
+  地址（`github.com/cruelsummera1-collab/throttle-zh`），程序
+  "关于"中的仓库链接随之指向新仓库；上游出处另由 README 与
+  LICENSE 中的标注保留。
 - 本文件覆盖的历史在 2026-10-23 作者重写后已按"检查方法"对
   全量提交复扫（结果随重写交付记录在案）；正式推送前请再复扫
   一次并更新本节的提交数。

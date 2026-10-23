@@ -15,6 +15,7 @@ mod backend;
 mod gui;
 mod history;
 mod icon;
+mod notify;
 mod single_instance;
 mod startup;
 mod types;
@@ -52,6 +53,11 @@ fn main() -> eframe::Result {
         let thread = std::thread::current().name().unwrap_or("?").to_string();
         tracing::error!("PANIC in thread '{thread}': {info}");
     }));
+
+    // 系统弹窗通知的启动准备：设置进程 AppUserModelID，并在后台线程
+    // 检查/补建带相同 AUMID 的开始菜单快捷方式（WinRT 通知显示所需）。
+    // 失败只记日志，绝不影响主流程。
+    notify::init();
 
     // GUI -> backend commands.
     let (cmd_tx, cmd_rx) = unbounded::<Command>();

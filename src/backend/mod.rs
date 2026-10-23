@@ -343,6 +343,15 @@ fn run_aggregator(shared: Arc<Shared>, cmd_rx: Receiver<Command>, snapshot_tx: S
                         "持续高上传告警: {} (pid {}) 以 {} B/s 上传已持续 {} 秒（阈值 {} B/s）",
                         ev.name, ev.pid, ev.up_rate, ev.sustained_secs, ev.threshold_bps
                     );
+                    // 第三条提醒通道：系统弹窗通知（与横幅、历史同一事件，
+                    // 每事件只弹一次；发送在独立短线程，失败只记日志）。
+                    crate::notify::notify_alert(
+                        &ev.name,
+                        ev.pid,
+                        ev.up_rate,
+                        ev.sustained_secs,
+                        ev.threshold_bps,
+                    );
                     let rec = crate::history::make_alert_record(
                         now,
                         tz_offset,

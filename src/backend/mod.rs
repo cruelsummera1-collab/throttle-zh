@@ -319,8 +319,14 @@ fn run_aggregator(shared: Arc<Shared>, cmd_rx: Receiver<Command>, snapshot_tx: S
             }
             recv(ticker) -> _ => {
                 tick += 1;
-                let (processes, total_down_rate, total_up_rate) =
+                let (mut processes, total_down_rate, total_up_rate) =
                     shared.flows.lock().unwrap().snapshot();
+                // 展示层友好名解析（按路径缓存，同一路径只读一次元数据，
+                // 失败回退 exe 名；不影响任何内部键与匹配逻辑）。
+                for p in processes.values_mut() {
+                    p.display_name =
+                        crate::names::display_name(&p.exe_path, &p.name);
+                }
                 let now = now_unix();
 
                 // --- 告警判断（纯状态机，开销可忽略） ---
@@ -345,8 +351,10 @@ fn run_aggregator(shared: Arc<Shared>, cmd_rx: Receiver<Command>, snapshot_tx: S
                     );
                     // 第三条提醒通道：系统弹窗通知（与横幅、历史同一事件，
                     // 每事件只弹一次；发送在独立短线程，失败只记日志）。
+                    // 文案用「友好名（exe名）」标签，历史存储仍记 exe 名。
+                    let label = crate::names::process_label(&ev.exe_path, &ev.name);
                     crate::notify::notify_alert(
-                        &ev.name,
+                        &label,
                         ev.pid,
                         ev.up_rate,
                         ev.sustained_secs,
@@ -410,6 +418,10 @@ fn run_aggregator(shared: Arc<Shared>, cmd_rx: Receiver<Command>, snapshot_tx: S
                     .max_by_key(|f| f.fired_tick)
                     .map(|f| crate::types::ActiveAlert {
                         name: f.name.clone(),
+                        display_name: crate::names::process_label(
+                            &f.exe_path,
+                            &f.name,
+                        ),
                         exe_path: f.exe_path.clone(),
                         pid: f.pid,
                         up_rate: processes.get(&f.key).map(|p| p.up_rate).unwrap_or(0),

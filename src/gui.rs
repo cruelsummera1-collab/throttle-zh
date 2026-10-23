@@ -150,6 +150,18 @@ fn display_process_name(name: &str, key_or_path: &str) -> String {
     }
 }
 
+/// 列表/详情里实际展示的名字：优先后端解析好的中文友好名
+/// （`ProcessStats.display_name`，如 weixin.exe→微信），为空时退回
+/// exe 文件名；合成行沿用上面的中文映射。
+fn shown_process_name(stats: &ProcessStats) -> String {
+    let base = if stats.display_name.is_empty() {
+        stats.name.as_str()
+    } else {
+        stats.display_name.as_str()
+    };
+    display_process_name(base, &stats.exe_path)
+}
+
 /// 把秒数格式化为"X 分 Y 秒"/"Y 秒"。
 fn format_duration(secs: u64) -> String {
     if secs >= 60 {
@@ -474,6 +486,12 @@ impl ThrottleApp {
         let Some(alert) = &snap.active_alert else {
             return;
         };
+        // 横幅用「友好名（exe名）」标签（后端已拼好），缺失时退回旧逻辑。
+        let alert_label = if alert.display_name.is_empty() {
+            display_process_name(&alert.name, &alert.exe_path)
+        } else {
+            alert.display_name.clone()
+        };
         egui::Panel::top("alert_banner").show(ui, |ui| {
             egui::Frame::new()
                 .fill(egui::Color32::from_rgb(0x7f, 0x1d, 0x1d))
@@ -483,7 +501,7 @@ impl ThrottleApp {
                         egui::RichText::new(format!(
                             "持续高上传提醒：{}（PID {}）正在以 {} 上传，已持续 {}（阈值 {}，触发于 {}）。\
                              这只说明该程序在持续上传数据，是否有问题请结合它的实际用途判断。",
-                            display_process_name(&alert.name, &alert.exe_path),
+                            alert_label,
                             alert.pid,
                             humanize_rate(alert.up_rate),
                             format_duration(alert.sustained_secs),
@@ -836,7 +854,7 @@ impl ThrottleApp {
                                 ui.label(format!(
                                     "{}  {}（PID {}）上传 {}，阈值 {}，已持续 {}",
                                     r.time,
-                                    display_process_name(&r.name, &r.exe_path),
+                                    crate::names::process_label(&r.exe_path, &r.name),
                                     r.pid,
                                     humanize_rate(r.up_rate),
                                     humanize_rate(r.threshold_bps),
@@ -863,7 +881,10 @@ impl ThrottleApp {
                             ui.label(format!(
                                 "{}  {}  下载 {} / 上传 {}",
                                 r.time,
-                                display_process_name(&r.name, &r.exe_path),
+                                display_process_name(
+                                    &crate::names::display_name(&r.exe_path, &r.name),
+                                    &r.exe_path,
+                                ),
                                 humanize_bytes(r.down_bytes),
                                 humanize_bytes(r.up_bytes),
                             ));
@@ -1006,7 +1027,7 @@ impl ThrottleApp {
                     return;
                 };
                 let key = stats.exe_path.clone();
-                ui.heading(display_process_name(&stats.name, &key));
+                ui.heading(shown_process_name(&stats));
                 ui.label(egui::RichText::new(&stats.exe_path).weak().small());
                 ui.separator();
 
@@ -1015,6 +1036,9 @@ impl ThrottleApp {
                     .show(ui, |ui| {
                         ui.label("PID");
                         ui.label(stats.pid.to_string());
+                        ui.end_row();
+                        ui.label("程序文件");
+                        ui.label(&stats.name);
                         ui.end_row();
                         ui.label("连接数");
                         ui.label(stats.flow_count.to_string());
@@ -1075,7 +1099,9 @@ impl ThrottleApp {
         rows.sort_by(|a, b| {
             let (a, b) = (&a.1, &b.1);
             let ord = match sort_column {
-                SortColumn::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                SortColumn::Name => shown_process_name(a)
+                    .to_lowercase()
+                    .cmp(&shown_process_name(b).to_lowercase()),
                 SortColumn::Flows => a.flow_count.cmp(&b.flow_count),
                 SortColumn::Down => a.down_rate.cmp(&b.down_rate),
                 SortColumn::Up => a.up_rate.cmp(&b.up_rate),
@@ -1120,7 +1146,7 @@ impl ThrottleApp {
                         if resp.clicked() || resp.secondary_clicked() {
                             self.selected = Some(key.clone());
                         }
-                        let shown_name = display_process_name(&stats.name, key);
+                        let shown_name = shown_process_name(stats);
                         self.row_context_menu(&resp, key, &shown_name);
                     });
                 });
@@ -1145,7 +1171,7 @@ impl ThrottleApp {
         };
 
         let cells: [egui::RichText; 7] = [
-            egui::RichText::new(display_process_name(&stats.name, key)),
+            egui::RichText::new(shown_process_name(stats)),
             egui::RichText::new(stats.flow_count.to_string()),
             egui::RichText::new(humanize_rate(stats.down_rate)).color(COLOR_DOWN),
             egui::RichText::new(humanize_rate(stats.up_rate)).color(COLOR_UP),

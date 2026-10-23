@@ -15,6 +15,7 @@ mod backend;
 mod gui;
 mod history;
 mod icon;
+mod names;
 mod notify;
 mod single_instance;
 mod startup;

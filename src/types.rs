@@ -25,8 +25,11 @@ pub struct ProcessStats {
     pub pid: u32,
     /// Full executable path (may be empty if resolution failed).
     pub exe_path: String,
-    /// File name portion, for display.
+    /// File name portion (internal identity; rules/alerts/history key on it).
     pub name: String,
+    /// 中文友好显示名（由聚合线程经 `crate::names` 解析后填入，可能与
+    /// `name` 相同；仅用于展示，不参与任何匹配逻辑）。
+    pub display_name: String,
     /// Current download rate, bytes/sec.
     pub down_rate: u64,
     /// Current upload rate, bytes/sec.
@@ -69,6 +72,8 @@ impl Default for AlertSettings {
 #[derive(Debug, Clone, Default)]
 pub struct ActiveAlert {
     pub name: String,
+    /// 「友好名（exe名）」形式的展示标签（与横幅/弹窗文案一致）。
+    pub display_name: String,
     pub exe_path: String,
     pub pid: u32,
     /// 当前上传速率（字节/秒）。

@@ -334,6 +334,7 @@ impl FlowTable {
                     pid: c.pid,
                     exe_path: exe.clone(),
                     name: display_name(exe),
+                    display_name: String::new(),
                     down_rate,
                     up_rate,
                     down_total: c.down_total,

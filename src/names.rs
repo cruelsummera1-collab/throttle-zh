@@ -321,7 +321,9 @@ mod win {
         let slice = unsafe { core::slice::from_raw_parts(ptr as *const u16, words) };
         Some(
             slice
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| (pair[0], pair[1]))
                 .collect(),
         )

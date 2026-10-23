@@ -53,6 +53,8 @@ pub struct HistoryRecord {
 }
 
 /// 构造一条告警事件记录。
+/// 参数是记录的各字段，数量由记录结构决定，故放行参数个数 lint。
+#[allow(clippy::too_many_arguments)]
 pub fn make_alert_record(
     ts: i64,
     utc_offset_secs: i64,

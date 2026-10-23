@@ -37,8 +37,10 @@ pub fn sample() -> Option<MemorySample> {
     use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
     use windows::Win32::System::Threading::GetCurrentProcess;
 
-    let mut counters = PROCESS_MEMORY_COUNTERS_EX::default();
-    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+    let mut counters = PROCESS_MEMORY_COUNTERS_EX {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+        ..Default::default()
+    };
     let ok = unsafe {
         GetProcessMemoryInfo(
             GetCurrentProcess(),

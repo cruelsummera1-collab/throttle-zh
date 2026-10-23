@@ -137,9 +137,7 @@ fn find_bool(text: &str, key: &str) -> Option<Option<bool>> {
         return Some(None);
     };
     let rest = text[pos + needle.len()..].trim_start();
-    let Some(rest) = rest.strip_prefix(':') else {
-        return None;
-    };
+    let rest = rest.strip_prefix(':')?;
     let rest = rest.trim_start();
     if let Some(t) = rest.strip_prefix("true") {
         if value_boundary_ok(t) {

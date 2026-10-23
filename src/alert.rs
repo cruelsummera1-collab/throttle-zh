@@ -236,9 +236,9 @@ mod tests {
     fn fires_only_after_sustained_above_threshold() {
         let mut e = engine();
         let s = sample("a.exe", 10, "a.exe", 150);
-        assert!(e.update(1, &[s.clone()]).is_empty());
-        assert!(e.update(2, &[s.clone()]).is_empty());
-        assert!(e.update(3, &[s.clone()]).is_empty());
+        assert!(e.update(1, std::slice::from_ref(&s)).is_empty());
+        assert!(e.update(2, std::slice::from_ref(&s)).is_empty());
+        assert!(e.update(3, std::slice::from_ref(&s)).is_empty());
         let ev = e.update(4, &[s]);
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0].sustained_secs, 3);
@@ -252,7 +252,7 @@ mod tests {
         let hi = sample("a.exe", 10, "a.exe", 500);
         let lo = sample("a.exe", 10, "a.exe", 0);
         // 两次 1 秒峰值，中间回落：不触发。
-        assert!(e.update(1, &[hi.clone()]).is_empty());
+        assert!(e.update(1, std::slice::from_ref(&hi)).is_empty());
         assert!(e.update(2, &[lo]).is_empty());
         assert!(e.update(3, &[hi]).is_empty());
         assert!(e.fired().is_empty());
@@ -263,12 +263,12 @@ mod tests {
         let mut e = engine();
         let hi = sample("a.exe", 10, "a.exe", 150);
         for t in 1..=4 {
-            e.update(t, &[hi.clone()]);
+            e.update(t, std::slice::from_ref(&hi));
         }
         assert_eq!(e.fired().len(), 1);
         // 持续超限：不再重复触发。
-        assert!(e.update(5, &[hi.clone()]).is_empty());
-        assert!(e.update(6, &[hi.clone()]).is_empty());
+        assert!(e.update(5, std::slice::from_ref(&hi)).is_empty());
+        assert!(e.update(6, std::slice::from_ref(&hi)).is_empty());
         // 回落到迟滞区（85，介于 80 与 100 之间）：仍保持已触发，不重复报。
         let mid = sample("a.exe", 10, "a.exe", 85);
         assert!(e.update(7, &[mid]).is_empty());
@@ -278,9 +278,9 @@ mod tests {
         assert!(e.update(8, &[lo]).is_empty());
         assert!(e.fired().is_empty());
         // 再次持续超限：应再次触发。
-        assert!(e.update(9, &[hi.clone()]).is_empty());
-        assert!(e.update(10, &[hi.clone()]).is_empty());
-        assert!(e.update(11, &[hi.clone()]).is_empty());
+        assert!(e.update(9, std::slice::from_ref(&hi)).is_empty());
+        assert!(e.update(10, std::slice::from_ref(&hi)).is_empty());
+        assert!(e.update(11, std::slice::from_ref(&hi)).is_empty());
         let ev = e.update(12, &[hi]);
         assert_eq!(ev.len(), 1);
     }
@@ -290,13 +290,13 @@ mod tests {
         let mut e = engine();
         let hi = sample("a.exe", 10, "a.exe", 150);
         let mid = sample("a.exe", 10, "a.exe", 90);
-        e.update(1, &[hi.clone()]);
-        e.update(2, &[hi.clone()]);
+        e.update(1, std::slice::from_ref(&hi));
+        e.update(2, std::slice::from_ref(&hi));
         // 第 3 秒掉进迟滞区：连续计时清零，不触发。
         assert!(e.update(3, &[mid]).is_empty());
-        e.update(4, &[hi.clone()]);
-        e.update(5, &[hi.clone()]);
-        assert!(e.update(6, &[hi.clone()]).is_empty());
+        e.update(4, std::slice::from_ref(&hi));
+        e.update(5, std::slice::from_ref(&hi));
+        assert!(e.update(6, std::slice::from_ref(&hi)).is_empty());
         let ev = e.update(7, &[hi]);
         assert_eq!(ev.len(), 1);
     }
@@ -306,13 +306,13 @@ mod tests {
         let mut e = AlertEngine::new(100, 3, vec!["Trusted.EXE".to_string()]);
         let s = sample("c:\\apps\\trusted.exe", 10, "trusted.exe", 9999);
         for t in 1..=10 {
-            assert!(e.update(t, &[s.clone()]).is_empty());
+            assert!(e.update(t, std::slice::from_ref(&s)).is_empty());
         }
         assert!(e.fired().is_empty());
         // 按完整路径忽略同样有效。
         let mut e2 = AlertEngine::new(100, 3, vec!["c:\\apps\\trusted.exe".to_string()]);
         for t in 1..=10 {
-            assert!(e2.update(t, &[s.clone()]).is_empty());
+            assert!(e2.update(t, std::slice::from_ref(&s)).is_empty());
         }
     }
 
@@ -324,9 +324,9 @@ mod tests {
         e.update(2, &[sample("a.exe", 10, "a.exe", 150)]);
         // 同一路径但 PID 变了（旧进程退出、新进程复用路径）：重新计时。
         let second = sample("a.exe", 77, "a.exe", 150);
-        assert!(e.update(3, &[second.clone()]).is_empty());
-        assert!(e.update(4, &[second.clone()]).is_empty());
-        assert!(e.update(5, &[second.clone()]).is_empty());
+        assert!(e.update(3, std::slice::from_ref(&second)).is_empty());
+        assert!(e.update(4, std::slice::from_ref(&second)).is_empty());
+        assert!(e.update(5, std::slice::from_ref(&second)).is_empty());
         let ev = e.update(6, &[second]);
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0].pid, 77);
@@ -337,7 +337,7 @@ mod tests {
         let mut e = engine();
         let s = sample("a.exe", 10, "a.exe", 150);
         for t in 1..=4 {
-            e.update(t, &[s.clone()]);
+            e.update(t, std::slice::from_ref(&s));
         }
         assert_eq!(e.fired().len(), 1);
         // 进程退出（不在快照中）：状态清除。
@@ -350,7 +350,7 @@ mod tests {
         let mut e = AlertEngine::new(0, 3, Vec::new());
         let s = sample("a.exe", 10, "a.exe", u64::MAX / 2);
         for t in 1..=10 {
-            assert!(e.update(t, &[s.clone()]).is_empty());
+            assert!(e.update(t, std::slice::from_ref(&s)).is_empty());
         }
         assert!(e.fired().is_empty());
     }
@@ -360,7 +360,7 @@ mod tests {
         let mut e = engine();
         let s = sample("a.exe", 10, "a.exe", 150);
         for t in 1..=4 {
-            e.update(t, &[s.clone()]);
+            e.update(t, std::slice::from_ref(&s));
         }
         assert_eq!(e.fired().len(), 1);
         e.set_config(200, 3, Vec::new());

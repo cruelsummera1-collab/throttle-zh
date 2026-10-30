@@ -201,11 +201,7 @@ fn install_chinese_fonts(ctx: &egui::Context) {
         let bytes = if bytes.starts_with(b"ttcf") {
             match crate::fontdata::first_face(&bytes) {
                 Some(face) => {
-                    tracing::info!(
-                        "已提取 TTC 首字重：{} → {} 字节",
-                        bytes.len(),
-                        face.len()
-                    );
+                    tracing::info!("已提取 TTC 首字重：{} → {} 字节", bytes.len(), face.len());
                     face
                 }
                 None => bytes,
@@ -347,9 +343,8 @@ impl ThrottleApp {
         install_chinese_fonts(&cc.egui_ctx);
         // 界面偏好：文件不存在/损坏都用默认值（缩到托盘默认开启），
         // 只记日志，绝不影响启动。
-        let (prefs_store, prefs_status) = crate::prefs::PrefsStore::load(
-            crate::prefs::prefs_path(&rules::config_dir()),
-        );
+        let (prefs_store, prefs_status) =
+            crate::prefs::PrefsStore::load(crate::prefs::prefs_path(&rules::config_dir()));
         match prefs_status {
             crate::prefs::LoadStatus::Loaded => {}
             crate::prefs::LoadStatus::Fresh => {
@@ -656,6 +651,28 @@ impl ThrottleApp {
         });
     }
 
+    /// 捕获模式异常横幅：只有后端报告粘性模式错误时显示（切换失败或句柄
+    /// 均打开失败）。文案即后端错误内容，不手动关闭、不超时清除；错误
+    /// 清除后横幅自动消失。切换瞬态（无错误）不显示，避免把正常的切换
+    /// 间隙报成故障。只要横幅在，界面就不应被理解为“限速已生效”。
+    fn draw_mode_banner(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
+        let Some(err) = &snap.mode_error else {
+            return;
+        };
+        egui::Panel::top("mode_banner").show(ui, |ui| {
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgb(0x7f, 0x4d, 0x00))
+                .inner_margin(egui::Margin::symmetric(8, 6))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("捕获模式异常：{err}"))
+                            .color(egui::Color32::WHITE)
+                            .strong(),
+                    );
+                });
+        });
+    }
+
     /// 实时读注册表刷新开机自启动状态（每次打开设置窗口时调用）。
     #[cfg(windows)]
     fn refresh_startup_status(&mut self) {
@@ -810,7 +827,9 @@ impl ThrottleApp {
                         .small(),
                 );
                 ui.separator();
-                ui.label("忽略名单（每行一个进程名或完整路径，不区分大小写；留空表示不忽略任何程序）：");
+                ui.label(
+                    "忽略名单（每行一个进程名或完整路径，不区分大小写；留空表示不忽略任何程序）：",
+                );
                 ui.add(
                     egui::TextEdit::multiline(&mut draft.ignore_text)
                         .desired_rows(4)
@@ -832,10 +851,7 @@ impl ThrottleApp {
                     );
                     match &startup_status {
                         Some(StartupStatus::ReadError(msg)) => {
-                            ui.colored_label(
-                                COLOR_BLOCK,
-                                format!("当前状态：读取失败：{msg}"),
-                            );
+                            ui.colored_label(COLOR_BLOCK, format!("当前状态：读取失败：{msg}"));
                             if ui.button("重试读取").clicked() {
                                 startup_action = Some(StartupAction::Refresh);
                             }
@@ -1000,8 +1016,7 @@ impl ThrottleApp {
     }
 
     fn open_history(&mut self) {
-        self.history_rows =
-            history::read_recent(&history::history_path(&rules::config_dir()), 500);
+        self.history_rows = history::read_recent(&history::history_path(&rules::config_dir()), 500);
         self.history_reset_confirm = false;
         self.history_open = true;
     }
@@ -1226,21 +1241,16 @@ impl ThrottleApp {
                     ui.separator();
                     ui.label(format!("{} 个进程", snap.processes.len()));
                     ui.separator();
-                    ui.label(format!(
-                        "总下载 {}",
-                        humanize_bytes(snap.grand_down_total)
-                    ));
-                    ui.label(format!(
-                        "总上传 {}",
-                        humanize_bytes(snap.grand_up_total)
-                    ));
+                    ui.label(format!("总下载 {}", humanize_bytes(snap.grand_down_total)));
+                    ui.label(format!("总上传 {}", humanize_bytes(snap.grand_up_total)));
                     ui.label(format!(
                         "合计 {}",
-                        humanize_bytes(
-                            snap.grand_down_total
-                                .saturating_add(snap.grand_up_total)
-                        )
+                        humanize_bytes(snap.grand_down_total.saturating_add(snap.grand_up_total))
                     ));
+                    // 实际捕获模式（后端维护）：让界面显示的永远是真实模式，
+                    // 而不是按规则推测的模式；异常时横幅另有错误说明。
+                    ui.separator();
+                    ui.label(format!("捕获：{}", snap.capture_mode.label()));
                 });
 
                 // Let the plot fill the panel's remaining height rather than
@@ -1381,9 +1391,7 @@ impl ThrottleApp {
                 SortColumn::Up => a.up_rate.cmp(&b.up_rate),
                 SortColumn::DownTotal => a.down_total.cmp(&b.down_total),
                 SortColumn::UpTotal => a.up_total.cmp(&b.up_total),
-                SortColumn::HistoryDownTotal => {
-                    a.history_down_total.cmp(&b.history_down_total)
-                }
+                SortColumn::HistoryDownTotal => a.history_down_total.cmp(&b.history_down_total),
                 SortColumn::HistoryUpTotal => a.history_up_total.cmp(&b.history_up_total),
             };
             if sort_desc { ord.reverse() } else { ord }
@@ -1489,11 +1497,9 @@ impl ThrottleApp {
             // System is shapable, but covers more than people expect.
             if is_system(key) {
                 ui.label(
-                    egui::RichText::new(
-                        "系统流量：包括 VPN 隧道、网络共享和 Windows 更新",
-                    )
-                    .weak()
-                    .small(),
+                    egui::RichText::new("系统流量：包括 VPN 隧道、网络共享和 Windows 更新")
+                        .weak()
+                        .small(),
                 );
                 ui.separator();
             }
@@ -1550,11 +1556,7 @@ impl ThrottleApp {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.label(format!("进程：{}", modal.name));
-                ui.label(
-                    egui::RichText::new("留空表示不限速。")
-                        .weak()
-                        .small(),
-                );
+                ui.label(egui::RichText::new("留空表示不限速。").weak().small());
                 ui.horizontal(|ui| {
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut modal.value)
@@ -1672,10 +1674,7 @@ impl eframe::App for ThrottleApp {
                         .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(60));
                     if log_due {
                         self.mem_logged_at = Some(now);
-                        tracing::info!(
-                            "内存占用（自报）：{}",
-                            crate::meminfo::summary_line(&s)
-                        );
+                        tracing::info!("内存占用（自报）：{}", crate::meminfo::summary_line(&s));
                     }
                 }
             }
@@ -1683,13 +1682,11 @@ impl eframe::App for ThrottleApp {
 
         // 托盘悬停提示跟随最新总速率刷新（快照约每秒一帧）。
         #[cfg(windows)]
-        if had_snapshot {
-            if let Some(tray) = &self.tray {
-                tray.set_tooltip(&crate::tray::tooltip_text(
-                    self.last_snapshot.total_down_rate,
-                    self.last_snapshot.total_up_rate,
-                ));
-            }
+        if had_snapshot && let Some(tray) = &self.tray {
+            tray.set_tooltip(&crate::tray::tooltip_text(
+                self.last_snapshot.total_down_rate,
+                self.last_snapshot.total_up_rate,
+            ));
         }
 
         // 托盘动作轮询：左键/双击/菜单「打开」恢复窗口，
@@ -1740,9 +1737,9 @@ impl eframe::App for ThrottleApp {
         // 低频帧排干快照、轮询托盘动作与上面的唤起对齐。后端抓包、
         // 告警、弹窗与累计都在后端线程里进行，不受影响。
         if self.window_hidden {
-            ctx.request_repaint_after(Duration::from_millis(
-                crate::repaint::repaint_delay_ms(true, false),
-            ));
+            ctx.request_repaint_after(Duration::from_millis(crate::repaint::repaint_delay_ms(
+                true, false,
+            )));
             return;
         }
 
@@ -1757,6 +1754,7 @@ impl eframe::App for ThrottleApp {
 
         self.draw_menu_bar(ui);
         self.draw_alert_banner(ui, &snap);
+        self.draw_mode_banner(ui, &snap);
         self.draw_top_panel(ui, &snap);
         self.draw_detail_panel(ui, &snap);
         self.draw_table(ui, &snap);
@@ -1769,13 +1767,11 @@ impl eframe::App for ThrottleApp {
         // 与快照节拍对齐，不再固定 500 ms 无条件排帧。egui 内部动画
         // 的重绘请求更短时会自然优先（取最早者）。
         let had_input = ctx.input(|i| {
-            !i.events.is_empty()
-                || i.pointer.any_down()
-                || i.pointer.velocity() != egui::Vec2::ZERO
+            !i.events.is_empty() || i.pointer.any_down() || i.pointer.velocity() != egui::Vec2::ZERO
         });
-        ctx.request_repaint_after(Duration::from_millis(
-            crate::repaint::repaint_delay_ms(false, had_input),
-        ));
+        ctx.request_repaint_after(Duration::from_millis(crate::repaint::repaint_delay_ms(
+            false, had_input,
+        )));
     }
 }
 
@@ -1809,27 +1805,40 @@ fn open_path(path: &std::path::Path) {
 
 pub struct ErrorApp {
     message: String,
+    kind: crate::relaunch::FailureKind,
+    /// 提权尝试被取消/失败后的提示（成功拉起会直接关窗，不留提示）。
+    note: Option<String>,
 }
 
 impl ErrorApp {
-    pub fn new(message: String) -> Self {
-        Self { message }
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        kind: crate::relaunch::FailureKind,
+        message: String,
+    ) -> Self {
+        // 与 ThrottleApp::new 同规矩：字体在 App 构造时装好，赶在
+        // 第一帧绘制之前。失败页以前漏了这一步，中文全是方框；
+        // 两个 App 的构造函数都是各自窗口的唯一入口，字体在此
+        // 安装可保证任何界面分支都不会再漏。
+        install_chinese_fonts(&cc.egui_ctx);
+        Self {
+            message,
+            kind,
+            note: None,
+        }
     }
 }
 
 impl eframe::App for ErrorApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let actions = crate::relaunch::actions_for(self.kind);
         egui::CentralPanel::default().show(ui, |ui| {
             ui.add_space(16.0);
             ui.vertical_centered(|ui| {
                 ui.heading("流量监控无法启动");
             });
             ui.add_space(12.0);
-            ui.label(
-                "后端初始化失败。常见原因：程序没有以管理员身份运行，\
-                 或者 WinDivert 驱动文件（WinDivert.dll / WinDivert64.sys）\
-                 不在程序所在的同一目录下。请确认后重新以管理员身份运行。",
-            );
+            ui.label(actions.body_text);
             ui.add_space(8.0);
             ui.separator();
             ui.add_space(8.0);
@@ -1843,9 +1852,32 @@ impl eframe::App for ErrorApp {
             });
             ui.add_space(12.0);
             ui.separator();
-            if ui.button("关闭").clicked() {
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            if let Some(note) = &self.note {
+                ui.label(egui::RichText::new(note).color(COLOR_BLOCK));
+                ui.add_space(8.0);
             }
+            ui.horizontal(|ui| {
+                if actions.show_elevate_button && ui.button("以管理员身份重新启动").clicked()
+                {
+                    match crate::relaunch::relaunch_elevated() {
+                        crate::relaunch::ElevateOutcome::Launched => {
+                            // 新实例已拉起（它会等待抢锁）：本实例立即
+                            // 退出，进程退出即释放单实例互斥量。
+                            tracing::info!("已拉起管理员实例，本实例退出让位");
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        outcome => {
+                            self.note = crate::relaunch::note_for_outcome(outcome);
+                            if let Some(note) = &self.note {
+                                tracing::warn!("提权重启未成功：{note}");
+                            }
+                        }
+                    }
+                }
+                if ui.button("关闭").clicked() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
         });
     }
 }

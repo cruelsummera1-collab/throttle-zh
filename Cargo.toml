@@ -51,3 +51,11 @@ strip = true
 lto = "fat"
 codegen-units = 1
 opt-level = "s"
+
+# 绑定补丁：windivert 0.6.0 的 shutdown 原为 &mut self，无法在共享句柄上
+# 跨线程调用，也就无法唤醒阻塞在 WinDivertRecv 里的线程（C API 对 recv
+# 没有超时或取消机制）。本补丁仅把 shutdown 的接收者改成 &self（函数体
+# 只转发句柄值给 C API，不改任何 Rust 状态），其余与上游 0.6.0 逐字节
+# 相同；close 仍为 &mut self，只在所有使用线程 join 后以唯一所有权调用。
+[patch.crates-io]
+windivert = { path = "patches/windivert" }

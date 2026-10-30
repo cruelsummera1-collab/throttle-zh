@@ -6,6 +6,58 @@ use std::collections::HashMap;
 /// Seconds of rate history kept per process for sparklines.
 pub const HISTORY_LEN: usize = 60;
 
+/// Capture mode of the network-layer WinDivert handle.
+///
+/// The mode is a pure function of the rule set (see
+/// `crate::backend::rules::desired_mode`): Divert while any rule is effective,
+/// Sniff otherwise. `Degraded` is not a desired mode — it only appears when
+/// no handle could be opened at all, and it is always accompanied by a sticky
+/// `mode_error` explaining why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum CaptureMode {
+    /// Sniff-only: the driver hands us copies of packets; the originals keep
+    /// flowing through the stack and are never re-injected. Used when no
+    /// effective throttle/block rule exists, so monitoring costs no
+    /// intercept/re-inject round-trip on the traffic path.
+    #[default]
+    Sniff,
+    /// Intercept: packets are diverted, shaped (or dropped) and re-injected
+    /// by the engine/drainer. Required while any effective rule exists.
+    Divert,
+    /// No working handle: neither capture nor shaping is active.
+    Degraded,
+}
+
+impl CaptureMode {
+    /// Compact encoding for lock-free sharing via `AtomicU8`.
+    pub fn to_u8(self) -> u8 {
+        match self {
+            CaptureMode::Sniff => 0,
+            CaptureMode::Divert => 1,
+            CaptureMode::Degraded => 2,
+        }
+    }
+
+    /// Inverse of [`CaptureMode::to_u8`]; unknown values map to Sniff (the
+    /// least invasive mode) rather than panicking.
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => CaptureMode::Divert,
+            2 => CaptureMode::Degraded,
+            _ => CaptureMode::Sniff,
+        }
+    }
+
+    /// 界面与日志用的中文模式名。
+    pub fn label(self) -> &'static str {
+        match self {
+            CaptureMode::Sniff => "监控",
+            CaptureMode::Divert => "拦截",
+            CaptureMode::Degraded => "异常",
+        }
+    }
+}
+
 /// A per-process traffic rule, matched by lowercase executable path.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Rule {
@@ -112,6 +164,12 @@ pub struct Snapshot {
     pub alert_settings: AlertSettings,
     /// 正在持续的上传告警（最近触发的一个）；无告警时为 None。
     pub active_alert: Option<ActiveAlert>,
+    /// 网络层捕获的实际模式（engine 维护；切换瞬态内仍报旧值）。
+    pub capture_mode: CaptureMode,
+    /// 粘性模式错误（engine 写入）：切换失败或句柄均打开失败时非空，
+    /// 界面据此显示横幅；只有成功切换或期望模式重新等于实际模式时清除。
+    /// 无错误时为 None（切换瞬态的期望/实际失配不算错误，不显示横幅）。
+    pub mode_error: Option<String>,
 }
 
 /// Commands sent from the GUI to the backend.

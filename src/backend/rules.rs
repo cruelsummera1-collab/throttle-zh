@@ -9,7 +9,30 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::types::CaptureMode;
 use crate::types::Rule;
+
+/// A rule is "effective" if it actually changes traffic: it blocks the
+/// process or limits at least one direction. A rule with both directions
+/// unlimited and not blocked is inert — it must not force intercept mode.
+/// Note `Some(0)` counts as effective: an explicit zero limit blocks that
+/// direction (see the engine's verdict logic).
+pub fn is_effective(rule: &Rule) -> bool {
+    rule.blocked || rule.down_limit.is_some() || rule.up_limit.is_some()
+}
+
+/// Desired capture mode for a whole rule set: Divert if ANY rule is
+/// effective, Sniff otherwise. This is deliberately evaluated over ALL
+/// applications' rules, not just one (e.g. the speed-test browser): a single
+/// effective rule anywhere keeps the whole capture path in intercept mode,
+/// because there is only one network-layer handle.
+pub fn desired_mode(rules: &HashMap<String, Rule>) -> CaptureMode {
+    if rules.values().any(is_effective) {
+        CaptureMode::Divert
+    } else {
+        CaptureMode::Sniff
+    }
+}
 
 /// Directory that holds our persisted state: `%APPDATA%\Throttle`.
 pub fn config_dir() -> PathBuf {
@@ -176,6 +199,60 @@ mod tests {
         assert!(r.down_limit.is_none());
         assert!(r.up_limit.is_none());
         assert!(!r.blocked);
+    }
+
+    #[test]
+    fn effective_rule_predicate_matrix() {
+        // Blocked counts even with no limits.
+        let blocked = Rule {
+            blocked: true,
+            ..Rule::default()
+        };
+        assert!(is_effective(&blocked));
+        // Either direction limited counts.
+        let down_only = Rule {
+            down_limit: Some(1024),
+            ..Rule::default()
+        };
+        assert!(is_effective(&down_only));
+        let up_only = Rule {
+            up_limit: Some(1024),
+            ..Rule::default()
+        };
+        assert!(is_effective(&up_only));
+        // An explicit zero limit blocks that direction, so it counts.
+        let zero_down = Rule {
+            down_limit: Some(0),
+            ..Rule::default()
+        };
+        assert!(is_effective(&zero_down));
+        // Both directions unlimited and not blocked: inert.
+        assert!(!is_effective(&Rule::default()));
+    }
+
+    #[test]
+    fn desired_mode_checks_all_rules_not_just_one() {
+        // Empty set: sniff.
+        let empty: HashMap<String, Rule> = HashMap::new();
+        assert_eq!(desired_mode(&empty), CaptureMode::Sniff);
+        // Only inert rules: still sniff (an inert rule must not force divert).
+        let mut inert_only: HashMap<String, Rule> = HashMap::new();
+        inert_only.insert("c:\\a.exe".to_string(), Rule::default());
+        inert_only.insert("c:\\b.exe".to_string(), Rule::default());
+        assert_eq!(desired_mode(&inert_only), CaptureMode::Sniff);
+        // One effective rule among many inert ones: divert. This is the
+        // multi-application case — the check must not stop at the first rule.
+        let mut mixed: HashMap<String, Rule> = HashMap::new();
+        mixed.insert("c:\\a.exe".to_string(), Rule::default());
+        mixed.insert(
+            "c:\\b.exe".to_string(),
+            Rule {
+                up_limit: Some(512 * 1024),
+                ..Rule::default()
+            },
+        );
+        mixed.insert("c:\\c.exe".to_string(), Rule::default());
+        assert_eq!(desired_mode(&mixed), CaptureMode::Divert);
     }
 
     #[test]

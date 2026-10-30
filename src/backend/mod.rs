@@ -11,10 +11,17 @@
 //!      shared state, and applies incoming [`Command`]s (rule edits, shutdown).
 //!
 //! Shutdown: a [`Command::Shutdown`] (or a disconnected command channel) clears
-//! the `running` flag and persists rules. The capture threads block in
-//! `WinDivert::recv`, so they observe the flag and exit on the next packet or
-//! flow event. The safe `windivert` wrapper takes `&mut self` for `shutdown`,
-//! which cannot be called on the `!Send` handle from another thread.
+//! the `running` flag, wakes the capture threads' blocked `recv` calls via
+//! the patched `WinDivert::shutdown(Recv)` (see the `patches/windivert` note
+//! in `Cargo.toml`), joins them with a bounded wait, flushes state, and
+//! explicitly closes both WinDivert handles. The join/close outcome is logged
+//! honestly: a timed-out thread or a failed close is reported as partial
+//! cleanup (reclaimed on process exit), never as "cleaned up".
+//!
+//! Capture modes: the engine runs the network handle in sniff mode while no
+//! rule is effective and in intercept mode while any rule is effective (see
+//! `engine.rs`); the aggregator publishes the desired mode on every rule
+//! change, and the engine switches the handle at a packet boundary.
 
 pub mod engine;
 pub mod flows;
@@ -24,38 +31,111 @@ pub mod synthetic;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use crossbeam_channel::{Receiver, Sender};
 use windivert::prelude::*;
 
-use crate::types::{Command, Rule, Snapshot};
+use crate::types::{CaptureMode, Command, Rule, Snapshot};
 
 /// State shared across all backend threads.
 ///
 /// Locking discipline: every thread holds at most one of `flows`, `rules`,
 /// `buckets` at any instant, so no lock-ordering deadlock is possible.
+/// `handle_slot` / `flow_handle` are read (cloned) per engine/drainer
+/// iteration and only written by the engine (switch) or the aggregator
+/// (shutdown close); the mode atomics are lock-free signals, and
+/// `mode_error` is written by the engine only.
 pub(crate) struct Shared {
     pub flows: Mutex<flows::FlowTable>,
     pub rules: Mutex<HashMap<String, Rule>>,
     pub buckets: Mutex<HashMap<engine::BucketKey, engine::ShapedBucket>>,
     pub running: AtomicBool,
+    /// Desired capture mode, as a `CaptureMode` byte. Written by the
+    /// aggregator on startup and on every rule change; read by the engine.
+    pub desired_mode: AtomicU8,
+    /// Actual capture mode, as a `CaptureMode` byte. Written by the engine
+    /// on every successful switch, fallback, or Degraded entry; read by the
+    /// aggregator (snapshots) and the engine/drainer (path selection).
+    pub actual_mode: AtomicU8,
+    /// Sticky mode error (engine-only writer). `None` means no error; the
+    /// aggregator copies it into snapshots for the GUI banner.
+    pub mode_error: Mutex<Option<String>>,
+    /// Current network-layer handle + its generation. The engine replaces
+    /// this on a mode switch; the engine and drainer clone it per iteration.
+    pub handle_slot: RwLock<Option<(Arc<engine::EngineHandle>, u64)>>,
+    /// Monotonic handle generation, incremented on every successful open.
+    /// Used for tracing switch history, not as a correctness mechanism (the
+    /// switch handshake, not the generation, guarantees exclusivity).
+    pub generation: AtomicU64,
+    /// Flow-layer handle, shared so the aggregator can wake its blocked
+    /// `recv` via `shutdown(Recv)` and close it after joining. `None` when
+    /// the flow handle failed to open at startup (flow events then simply
+    /// do not run; socket-table refresh still attributes).
+    pub flow_handle: RwLock<Option<Arc<FlowHandle>>>,
+    /// Capture-thread join handles, moved here at startup so the aggregator
+    /// can join them (bounded) on shutdown. Taken exactly once.
+    pub capture_handles: Mutex<Option<CaptureHandles>>,
+    /// Set by the engine as its very last action, after which it never
+    /// receives or enqueues again. The drainer waits for this before its
+    /// final flush, so no packet can land in an unflushed queue.
+    pub engine_stopped: AtomicBool,
+    /// True while the engine is switching handles. The drainer pauses while
+    /// this is set (see `drainer_idle`).
+    pub switching: AtomicBool,
+    /// True while the drainer is paused for a switch (holds no handle clone,
+    /// sends nothing). The engine waits for this before closing the old
+    /// handle, which is what makes `try_unwrap` succeed.
+    pub drainer_idle: AtomicBool,
 }
+
+/// The flow-layer WinDivert handle, shared by the flow-events thread (recv)
+/// and the aggregator (shutdown wake + post-join close).
+///
+/// Safety: same reasoning as [`engine::EngineHandle`] — the WinDivert C API
+/// documents handles as thread-safe; the Rust wrapper is conservative in not
+/// implementing Send/Sync.
+pub struct FlowHandle(pub WinDivert<FlowLayer>);
+unsafe impl Send for FlowHandle {}
+unsafe impl Sync for FlowHandle {}
+
+/// Join handles of the three capture threads. The flow handle is optional:
+/// when the flow-layer handle fails to open at startup, no flow thread runs.
+pub(crate) struct CaptureHandles {
+    pub flow: Option<JoinHandle<()>>,
+    pub engine: JoinHandle<()>,
+    pub drainer: JoinHandle<()>,
+}
+
+/// Which capture threads were actually joined on shutdown. A `false` entry
+/// means that thread did not finish within the bounded wait: it was NOT
+/// joined (joining would block) and its handle was NOT closed — the shutdown
+/// report must say so, not claim a clean exit.
+pub(crate) struct JoinOutcome {
+    pub flow: bool,
+    pub engine: bool,
+    pub drainer: bool,
+}
+
+/// How long the aggregator waits for all capture threads to finish on
+/// shutdown. Threads poll `is_finished` on this interval; a thread that has
+/// not finished by the deadline is left running (and reported as such).
+const SHUTDOWN_JOIN_WAIT: Duration = Duration::from_secs(5);
+/// Poll interval while waiting for capture threads to finish.
+const SHUTDOWN_JOIN_POLL: Duration = Duration::from_millis(50);
 
 /// Handle to the running backend. The GUI reads snapshots from `snapshot_rx`.
 pub struct Backend {
     /// ~1 Hz stream of state snapshots for the GUI.
     pub snapshot_rx: Receiver<Snapshot>,
-    /// The aggregator thread: the one that persists rules on shutdown.
+    /// The aggregator thread: on shutdown it wakes and joins the capture
+    /// threads (bounded), persists rules/history/totals, and closes both
+    /// WinDivert handles before returning.
     aggregator: JoinHandle<()>,
-    /// The capture threads. Kept alive with the backend; not joined on exit
-    /// because they block in `WinDivert::recv` until the next packet arrives.
-    #[allow(dead_code)]
-    capture: Vec<JoinHandle<()>>,
 }
 
 impl Backend {
@@ -63,7 +143,10 @@ impl Backend {
     /// [`Command::Shutdown`] (or dropping the command sender) and before the
     /// process exits: the aggregator writes `rules.json` on its way out, and
     /// exiting underneath it leaves the file truncated, silently losing every
-    /// rule. The capture threads are left to die with the process.
+    /// rule. By the time the aggregator returns, the capture threads have
+    /// been joined (bounded) and the handles closed — except for any thread
+    /// or handle the shutdown log reports as timed out / unclosed, which is
+    /// then reclaimed on process exit.
     pub fn join(self) {
         let _ = self.aggregator.join();
     }
@@ -75,44 +158,83 @@ impl Backend {
 /// Fails early with a clear message if WinDivert cannot be opened (typically:
 /// not running elevated, or `WinDivert.dll`/driver missing).
 pub fn start(cmd_rx: Receiver<Command>) -> anyhow::Result<Backend> {
+    // Load rules first: the initial capture mode is a function of them.
+    let rules = rules::load();
+    let initial_mode = rules::desired_mode(&rules);
     // Open the single shared network-layer handle up front so failures (not
     // elevated, driver missing) surface as a friendly error. Both the engine
-    // and drainer threads use this one handle (see engine::EngineHandle).
-    let engine_handle = Arc::new(engine::open().context(
-        "无法打开 WinDivert：请以管理员身份运行本程序，并确认 WinDivert.dll \
-         与 WinDivert64.sys 和程序在同一目录下",
-    )?);
+    // and drainer threads use this one handle (see engine::EngineHandle),
+    // published in the shared slot for mode switches.
+    let engine_handle = Arc::new(
+        if initial_mode == CaptureMode::Divert {
+            engine::open()
+        } else {
+            engine::open_sniff()
+        }
+        .context(
+            "无法打开 WinDivert：请以管理员身份运行本程序，并确认 WinDivert.dll \
+             与 WinDivert64.sys 和程序在同一目录下",
+        )?,
+    );
+    tracing::info!("initial capture mode: {}", initial_mode.label());
 
-    let rules = rules::load();
+    // Flow-layer handle: unlike the network handle, a failure here must not
+    // fail startup (socket-table refresh still attributes). On failure, no
+    // flow thread runs and `flow_handle` stays None.
+    let flow_handle = match WinDivert::flow("true", 0, WinDivertFlags::new()) {
+        Ok(h) => Some(Arc::new(FlowHandle(h))),
+        Err(e) => {
+            tracing::error!("failed to open WinDivert flow handle (flow events disabled): {e}");
+            None
+        }
+    };
+
     let shared = Arc::new(Shared {
         flows: Mutex::new(flows::FlowTable::new()),
         rules: Mutex::new(rules),
         buckets: Mutex::new(HashMap::new()),
         running: AtomicBool::new(true),
+        desired_mode: AtomicU8::new(initial_mode.to_u8()),
+        actual_mode: AtomicU8::new(initial_mode.to_u8()),
+        mode_error: Mutex::new(None),
+        handle_slot: RwLock::new(Some((engine_handle, 0))),
+        generation: AtomicU64::new(0),
+        flow_handle: RwLock::new(flow_handle.clone()),
+        capture_handles: Mutex::new(None),
+        engine_stopped: AtomicBool::new(false),
+        switching: AtomicBool::new(false),
+        drainer_idle: AtomicBool::new(false),
     });
 
     // 有界通道（容量 2）：界面只展示最新一帧，GUI 卡顿时旧快照无需
     // 排队堆积；聚合线程用 try_send，满时丢弃当秒快照（见 run_aggregator）。
     let (snapshot_tx, snapshot_rx) = crossbeam_channel::bounded::<Snapshot>(2);
 
-    let mut handles = Vec::with_capacity(3);
+    let flow_thread = match flow_handle {
+        Some(handle) => Some(spawn_named("throttle-flow-events", {
+            let shared = shared.clone();
+            move || run_flow_events(shared, handle)
+        })?),
+        None => None,
+    };
 
-    handles.push(spawn_named("throttle-flow-events", {
+    let engine_thread = spawn_named("throttle-engine", {
         let shared = shared.clone();
-        move || run_flow_events(shared)
-    })?);
+        move || engine::run_engine(shared)
+    })?;
 
-    handles.push(spawn_named("throttle-engine", {
+    let drainer_thread = spawn_named("throttle-drainer", {
         let shared = shared.clone();
-        let handle = engine_handle.clone();
-        move || engine::run_engine(shared, handle)
-    })?);
+        move || engine::run_drainer(shared)
+    })?;
 
-    handles.push(spawn_named("throttle-drainer", {
-        let shared = shared.clone();
-        let handle = engine_handle.clone();
-        move || engine::run_drainer(shared, handle)
-    })?);
+    // Hand the capture threads to the aggregator via Shared: it joins them
+    // (bounded) on shutdown before persisting and closing the handles.
+    *shared.capture_handles.lock().unwrap() = Some(CaptureHandles {
+        flow: flow_thread,
+        engine: engine_thread,
+        drainer: drainer_thread,
+    });
 
     let aggregator = spawn_named("throttle-aggregator", {
         let shared = shared.clone();
@@ -122,7 +244,6 @@ pub fn start(cmd_rx: Receiver<Command>) -> anyhow::Result<Backend> {
     Ok(Backend {
         snapshot_rx,
         aggregator,
-        capture: handles,
     })
 }
 
@@ -144,17 +265,15 @@ const TABLE_REFRESH: Duration = Duration::from_secs(2);
 
 /// Flow-event thread: bootstrap existing connections, then track flow
 /// establishment/teardown to keep the 5-tuple to process map current.
-fn run_flow_events(shared: Arc<Shared>) {
+///
+/// The handle is created in [`start`] and shared (so the aggregator can wake
+/// its blocked `recv` via `shutdown(Recv)` and close it after joining); this
+/// thread never closes it.
+fn run_flow_events(shared: Arc<Shared>, handle: Arc<FlowHandle>) {
     // Bootstrap pre-existing TCP connections before we start listening.
     shared.flows.lock().unwrap().bootstrap_tcp();
 
-    let divert = match WinDivert::flow("true", 0, WinDivertFlags::new()) {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::error!("flow-events: failed to open WinDivert flow handle: {e}");
-            return;
-        }
-    };
+    let divert = &handle.0;
     tracing::info!("flow-events thread started");
 
     // Diagnostics: log the first few events of each protocol so a protocol
@@ -166,6 +285,11 @@ fn run_flow_events(shared: Arc<Shared>) {
             Ok(p) => p,
             Err(WinDivertError::Recv(WinDivertRecvError::NoData)) => break,
             Err(e) => {
+                if !shared.running.load(Ordering::Relaxed) {
+                    // Shutdown path: the aggregator woke us via
+                    // shutdown(Recv). Leave without touching the handle.
+                    break;
+                }
                 tracing::warn!("flow-events: recv error: {e}");
                 continue;
             }
@@ -205,6 +329,165 @@ fn run_flow_events(shared: Arc<Shared>) {
         }
     }
     tracing::info!("flow-events thread exiting");
+}
+
+/// Shutdown step 1: stop the capture threads.
+///
+/// Sets `running` to false, wakes the network and flow handles' blocked
+/// `recv` calls via the patched `WinDivert::shutdown(Recv)` (cross-thread,
+/// `&self` — see the `patches/windivert` note in `Cargo.toml`), then joins
+/// the capture threads with a bounded wait.
+///
+/// Join semantics are exact: `is_finished` only reports, `join` reaps. The
+/// loop polls `is_finished` until all threads finished or the deadline
+/// passes, then calls `join` ONLY on finished threads (joining an unfinished
+/// thread would block). A thread that did not finish is left running and
+/// reported as such — never described as cleaned up. A `join` error means
+/// the thread panicked (logged, still counts as finished).
+///
+/// On `shutdown(Recv)` semantics: it closes only the receive side; the
+/// drainer's exit flush still sends through the same handle afterwards, and
+/// the handle itself is closed separately (see [`close_capture_handles`])
+/// after the join.
+fn shutdown_capture_threads(shared: &Shared) -> JoinOutcome {
+    shared.running.store(false, Ordering::Relaxed);
+
+    if let Some((handle, _)) = shared.handle_slot.read().unwrap().clone()
+        && let Err(e) = handle.0.shutdown(WinDivertShutdownMode::Recv)
+    {
+        tracing::warn!("shutdown: network handle shutdown(Recv) failed: {e}");
+    }
+    if let Some(handle) = shared.flow_handle.read().unwrap().clone()
+        && let Err(e) = handle.0.shutdown(WinDivertShutdownMode::Recv)
+    {
+        tracing::warn!("shutdown: flow handle shutdown(Recv) failed: {e}");
+    }
+
+    let Some(handles) = shared.capture_handles.lock().unwrap().take() else {
+        tracing::warn!("shutdown: capture handles already taken (no threads to join)");
+        return JoinOutcome {
+            flow: true,
+            engine: false,
+            drainer: false,
+        };
+    };
+
+    // Poll until all finished or the deadline passes.
+    let deadline = Instant::now() + SHUTDOWN_JOIN_WAIT;
+    loop {
+        let flow_done = handles.flow.as_ref().is_none_or(|h| h.is_finished());
+        if flow_done && handles.engine.is_finished() && handles.drainer.is_finished() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(SHUTDOWN_JOIN_POLL);
+    }
+
+    // Join only finished threads (joining an unfinished one would block).
+    let CaptureHandles {
+        flow,
+        engine,
+        drainer,
+    } = handles;
+    let mut outcome = JoinOutcome {
+        flow: true,
+        engine: false,
+        drainer: false,
+    };
+    if let Some(h) = flow {
+        if h.is_finished() {
+            if let Err(e) = h.join() {
+                tracing::warn!("shutdown: flow thread panicked: {e:?}");
+            }
+            outcome.flow = true;
+        } else {
+            tracing::warn!(
+                "shutdown: flow thread did NOT finish within {SHUTDOWN_JOIN_WAIT:?}; NOT joined, handle NOT closed (reclaimed on process exit)"
+            );
+            outcome.flow = false;
+        }
+    }
+    if engine.is_finished() {
+        if let Err(e) = engine.join() {
+            tracing::warn!("shutdown: engine thread panicked: {e:?}");
+        }
+        outcome.engine = true;
+    } else {
+        tracing::warn!(
+            "shutdown: engine thread did NOT finish within {SHUTDOWN_JOIN_WAIT:?}; NOT joined, handle NOT closed (reclaimed on process exit)"
+        );
+    }
+    if drainer.is_finished() {
+        if let Err(e) = drainer.join() {
+            tracing::warn!("shutdown: drainer thread panicked: {e:?}");
+        }
+        outcome.drainer = true;
+    } else {
+        tracing::warn!(
+            "shutdown: drainer thread did NOT finish within {SHUTDOWN_JOIN_WAIT:?}; NOT joined, handle NOT closed (reclaimed on process exit)"
+        );
+    }
+    outcome
+}
+
+/// Shutdown step 2: explicitly close the WinDivert handles, gated on which
+/// threads were actually joined.
+///
+/// The network handle is used by the engine (recv+send) and the drainer
+/// (send), so it is closed only when BOTH joined; the flow handle only when
+/// the flow thread joined (or never existed). Closing uses unique ownership
+/// (`try_unwrap`): if an unexpected holder remains, the close is skipped and
+/// logged, not forced. Only a `close` returning `Ok` is reported as
+/// "explicitly closed"; anything else is reported as unclosed (reclaimed on
+/// process exit), never as cleaned up.
+fn close_capture_handles(shared: &Shared, outcome: &JoinOutcome) {
+    if outcome.engine && outcome.drainer {
+        if let Some((handle, _)) = shared.handle_slot.write().unwrap().take() {
+            match Arc::try_unwrap(handle) {
+                Ok(mut h) => match h.0.close(CloseAction::Nothing) {
+                    Ok(()) => tracing::info!("shutdown: network handle closed explicitly"),
+                    Err(e) => tracing::warn!(
+                        "shutdown: network handle close failed (reclaimed on process exit): {e}"
+                    ),
+                },
+                Err(_) => tracing::warn!(
+                    "shutdown: network handle still shared, skipping close (reclaimed on process exit)"
+                ),
+            }
+        } else {
+            tracing::info!("shutdown: no network handle in slot (already closed or Degraded)");
+        }
+    } else {
+        tracing::warn!(
+            "shutdown: network handle NOT closed (engine joined={}, drainer joined={}); reclaimed on process exit",
+            outcome.engine,
+            outcome.drainer
+        );
+    }
+
+    if outcome.flow {
+        if let Some(handle) = shared.flow_handle.write().unwrap().take() {
+            match Arc::try_unwrap(handle) {
+                Ok(mut h) => match h.0.close(CloseAction::Nothing) {
+                    Ok(()) => tracing::info!("shutdown: flow handle closed explicitly"),
+                    Err(e) => tracing::warn!(
+                        "shutdown: flow handle close failed (reclaimed on process exit): {e}"
+                    ),
+                },
+                Err(_) => tracing::warn!(
+                    "shutdown: flow handle still shared, skipping close (reclaimed on process exit)"
+                ),
+            }
+        } else {
+            tracing::info!("shutdown: no flow handle (never opened or already closed)");
+        }
+    } else {
+        tracing::warn!(
+            "shutdown: flow handle NOT closed (flow thread not joined); reclaimed on process exit"
+        );
+    }
 }
 
 /// Aggregator thread: emit a snapshot every second and apply commands.
@@ -271,6 +554,12 @@ fn run_aggregator(shared: Arc<Shared>, cmd_rx: Receiver<Command>, snapshot_tx: S
                         if let Err(e) = rules::save(&snapshot) {
                             tracing::warn!("failed to persist rules: {e}");
                         }
+                        // Recompute the desired capture mode from the new rule
+                        // set: the engine switches the handle at its loop-top.
+                        let desired = rules::desired_mode(&snapshot);
+                        shared
+                            .desired_mode
+                            .store(desired.to_u8(), Ordering::Relaxed);
                     }
                     Ok(Command::RemoveRule(path)) => {
                         let key = path.to_lowercase();
@@ -279,16 +568,28 @@ fn run_aggregator(shared: Arc<Shared>, cmd_rx: Receiver<Command>, snapshot_tx: S
                             rules.remove(&key);
                             rules.clone()
                         };
-                        // A removed rule may have left shaping buckets behind; drop them
-                        // so held packets are released and no stale limit lingers.
-                        shared
-                            .buckets
-                            .lock()
-                            .unwrap()
-                            .retain(|(exe, _), _| exe != &key);
+                        // A removed rule may have left shaping buckets behind.
+                        // Release them (infinite rate) instead of dropping
+                        // them: the drainer flushes the held packets on its
+                        // next pass (or the mode-switch flush does, if this
+                        // was the last effective rule), so removal never
+                        // loses queued packets, and no stale limit lingers
+                        // (a re-added rule resets the rate on its next packet).
+                        {
+                            let mut buckets = shared.buckets.lock().unwrap();
+                            for ((exe, _), bucket) in buckets.iter_mut() {
+                                if exe == &key {
+                                    bucket.release();
+                                }
+                            }
+                        }
                         if let Err(e) = rules::save(&snapshot) {
                             tracing::warn!("failed to persist rules: {e}");
                         }
+                        let desired = rules::desired_mode(&snapshot);
+                        shared
+                            .desired_mode
+                            .store(desired.to_u8(), Ordering::Relaxed);
                     }
                     Ok(Command::SetAlertSettings(mut s)) => {
                         s.ignore = s
@@ -318,7 +619,11 @@ fn run_aggregator(shared: Arc<Shared>, cmd_rx: Receiver<Command>, snapshot_tx: S
                     Ok(Command::Shutdown) | Err(_) => {
                         // Explicit shutdown, or the GUI dropped the command sender.
                         tracing::info!("aggregator: shutting down");
-                        shared.running.store(false, Ordering::Relaxed);
+                        // Wake the capture threads' blocked recvs, join them
+                        // (bounded), and only then persist: the drainer's
+                        // exit flush runs before it returns, so flushed bytes
+                        // are included in the totals below.
+                        let outcome = shutdown_capture_threads(&shared);
                         // 补写退出前最后一个周期的历史增量（尽力而为）。
                         flush_history(
                             &mut accumulator,
@@ -335,6 +640,10 @@ fn run_aggregator(shared: Arc<Shared>, cmd_rx: Receiver<Command>, snapshot_tx: S
                         if let Err(e) = rules::save(&snapshot) {
                             tracing::warn!("failed to persist rules on shutdown: {e}");
                         }
+                        // Explicitly close the handles (gated on which threads
+                        // were actually joined); anything unclosed is reported,
+                        // not claimed as cleaned.
+                        close_capture_handles(&shared, &outcome);
                         break;
                     }
                 }
@@ -499,6 +808,9 @@ fn run_aggregator(shared: Arc<Shared>, cmd_rx: Receiver<Command>, snapshot_tx: S
                     totals_store.grand_display();
 
                 let rules = shared.rules.lock().unwrap().clone();
+                let capture_mode =
+                    CaptureMode::from_u8(shared.actual_mode.load(Ordering::Relaxed));
+                let mode_error = shared.mode_error.lock().unwrap().clone();
                 let snapshot = Snapshot {
                     processes,
                     total_down_rate,
@@ -510,6 +822,8 @@ fn run_aggregator(shared: Arc<Shared>, cmd_rx: Receiver<Command>, snapshot_tx: S
                     rules,
                     alert_settings: alert_settings.clone(),
                     active_alert,
+                    capture_mode,
+                    mode_error,
                 };
                 match snapshot_tx.try_send(snapshot) {
                     Ok(()) => {}
@@ -520,7 +834,7 @@ fn run_aggregator(shared: Arc<Shared>, cmd_rx: Receiver<Command>, snapshot_tx: S
                     Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
                         // GUI receiver gone: nothing left to feed.
                         tracing::info!("aggregator: snapshot receiver dropped, stopping");
-                        shared.running.store(false, Ordering::Relaxed);
+                        let outcome = shutdown_capture_threads(&shared);
                         flush_history(
                             &mut accumulator,
                             &hist_path,
@@ -531,6 +845,13 @@ fn run_aggregator(shared: Arc<Shared>, cmd_rx: Receiver<Command>, snapshot_tx: S
                         if let Err(e) = totals_store.save(&totals_path) {
                             tracing::warn!("failed to persist totals on stop: {e}");
                         }
+                        // Save rules too (same shutdown path as
+                        // Command::Shutdown; previously this arm skipped it).
+                        let snapshot = shared.rules.lock().unwrap().clone();
+                        if let Err(e) = rules::save(&snapshot) {
+                            tracing::warn!("failed to persist rules on stop: {e}");
+                        }
+                        close_capture_handles(&shared, &outcome);
                         break;
                     }
                 }
